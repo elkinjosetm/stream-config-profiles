@@ -37,7 +37,8 @@ The tool uses a two-phase strategy designed to survive crashes and unexpected di
 ```
 stream-config-profiles\
 ├── sync-configs.ps1       # Main executable (called by Vibepollo)
-├── paths.txt              # YOUR CONFIG: one path per line
+├── paths.example.txt      # Template: copy this to paths.txt to get started
+├── paths.txt              # YOUR CONFIG: one path per line (gitignored — safe across updates)
 ├── state.json             # Written by the script (session state)
 ├── sync.log               # Append-only debug log
 └── profiles\              # Created automatically
@@ -48,7 +49,9 @@ stream-config-profiles\
 
 ### Editing paths.txt
 
-List the full paths to game config files or folders you want managed:
+**First, create `paths.txt` from the template:** Copy `paths.example.txt` to `paths.txt` in the same folder. The template is shipped with the tool; `paths.txt` is gitignored, so your personal game paths stay out of version control and remain safe across updates.
+
+Then open `paths.txt` in a text editor and list the full paths to game config files or folders you want managed:
 
 ```
 # One path per line. No quotes, even with spaces.
@@ -101,5 +104,7 @@ Check **sync.log** for details. Each log line shows the timestamp, mode (do/undo
 2. Confirm the path in `paths.txt` exists on your system (expand environment variables manually if unsure)
 3. Check sync.log for errors or warnings on that path
 4. Verify each client name in Vibepollo matches what you expect (the tool uses `APOLLO_CLIENT_NAME` env var, fallback `SUNSHINE_CLIENT_NAME`)
+
+**If `paths.txt` is missing:** The tool logs `paths-file-missing` in sync.log and syncs nothing until you create it (by copying `paths.example.txt` to `paths.txt`). The profile folders and state.json are still created/updated as usual — `profiles\_local\`, `profiles\<ClientName>\`, and an `activeClient` entry in state.json all still appear — they will simply be empty/pointing at zero synced paths, so their presence alone does not mean the tool is actually syncing anything.
 
 If you don't see a log entry at all, the tool may not have run — verify the Vibepollo do/undo commands are registered correctly (see install.md).

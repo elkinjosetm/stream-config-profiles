@@ -750,6 +750,15 @@ function Main {
         New-Item -ItemType Directory -Path $profilesRoot -Force | Out-Null
     }
 
+    if (-not (Test-Path -LiteralPath $pathsFile)) {
+        # paths.txt is gitignored and created by the user from
+        # paths.example.txt during install (see SPEC.md). Its absence is not
+        # fatal -- Get-ConfigPaths already tolerates a missing file and
+        # returns zero paths -- but it's worth a log line so a user who
+        # forgot the copy step can tell why nothing is being synced.
+        Write-SyncLog -LogFile $logFile -ModeLabel $Mode -Client $client -Action 'paths-file-missing' -Path $pathsFile
+    }
+
     $paths = Get-ConfigPaths -PathsFile $pathsFile
 
     if ($Mode -eq 'do') {

@@ -1,0 +1,14 @@
+# Your game config paths — one per line, no quotes even if the path has
+# spaces. File or folder — detected automatically. Blank lines and lines
+# starting with # are ignored. Comments let you remember which game each
+# path belongs to.
+#
+# (Shipped as paths.example.txt: if this file is still named
+# paths.example.txt, copy it to paths.txt in this same folder and edit
+# the copy — paths.txt is gitignored so your personal paths stay out of
+# version control.)
+#
+# The example below is intentionally commented out — a fresh install
+# syncs nothing until you uncomment/replace it with your game's actual
+# config path (see README for details):
+# %LOCALAPPDATA%\YourGame\Settings\graphics.ini

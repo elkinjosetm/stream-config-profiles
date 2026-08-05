@@ -8,7 +8,7 @@
     drives the real script via a child PowerShell process exactly the way
     Vibepollo would (env var + -Mode do|undo), and asserts on-disk /
     profile / state.json outcomes for every scenario in the task brief
-    (T1..T17). Prints a PASS/FAIL table and exits non-zero if anything
+    (T1..T18). Prints a PASS/FAIL table and exits non-zero if anything
     failed.
 
     The child host mirrors whichever host is running this harness: PSEdition
@@ -924,6 +924,80 @@ Invoke-Scenario -Name 'T17: trailing separator on a folder path normalizes to a 
 
     $allEntries = @(Get-ChildItem -LiteralPath $localDir -Directory -ErrorAction SilentlyContinue)
     Assert-That ($allEntries.Count -eq 1) "expected exactly one profile entry under _local, found $($allEntries.Count): $($allEntries.Name -join ', ')"
+} | Out-Null
+
+# ===========================================================================
+# T18 — missing paths.txt: 'do' with a client set must still succeed (zero
+# paths), log 'paths-file-missing', and still write state.json.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T18: missing paths.txt -> logged, exit 0, state.json still written, folders empty' -Body {
+    $sb = New-Sandbox -Label 'T18'
+    # Deliberately do NOT call Set-PathsFile -- the sandbox's paths.txt must
+    # not exist for this scenario.
+    Assert-That (-not (Test-Path -LiteralPath $sb.PathsFile)) 'sandbox paths.txt must not exist for this scenario'
+
+    $rc = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'T18Client'
+    Assert-That ($rc -eq 0) "exit code expected 0, got $rc"
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'action=paths-file-missing') 'sync.log should record paths-file-missing'
+    Assert-That ($null -ne $log -and $log -match [regex]::Escape($sb.PathsFile)) 'sync.log should mention the paths.txt path'
+
+    Assert-That (Test-Path -LiteralPath $sb.StateFile) 'state.json should still be written even with zero configured paths'
+    $state = Get-Content -LiteralPath $sb.StateFile -Raw | ConvertFrom-Json
+    Assert-That ($state.activeClient -eq 'T18Client') "state.activeClient expected 'T18Client', got '$($state.activeClient)'"
+
+    # A missing paths.txt must not stop the tool from creating the usual
+    # (empty) folder scaffolding -- this is exactly what makes the failure
+    # mode silent: everything LOOKS like it worked except the folders hold
+    # nothing.
+    $clientDir = Join-Path $sb.ProfilesDir 'T18Client'
+    $localDir = Join-Path $sb.ProfilesDir '_local'
+    Assert-That (Test-Path -LiteralPath $clientDir) 'client profile dir should still be created even with paths.txt missing'
+    Assert-That (Test-Path -LiteralPath $localDir) '_local profile dir should still be created even with paths.txt missing'
+    Assert-That (@(Get-ChildItem -LiteralPath $clientDir -Force -ErrorAction SilentlyContinue).Count -eq 0) 'client profile dir should be empty when paths.txt is missing (zero configured paths)'
+    Assert-That (@(Get-ChildItem -LiteralPath $localDir -Force -ErrorAction SilentlyContinue).Count -eq 0) '_local profile dir should be empty when paths.txt is missing (zero configured paths)'
+
+    # The undo leg must behave the same way: still logs paths-file-missing,
+    # still exits 0, still clears state.json -- nothing about the missing
+    # paths.txt should make undo behave differently from a normal session.
+    $rcUndo = Invoke-Sync -Sandbox $sb -Mode 'undo' -ApolloClient 'T18Client'
+    Assert-That ($rcUndo -eq 0) "undo exit code expected 0, got $rcUndo"
+
+    $logAfterUndo = Read-TextFile $sb.LogFile
+    $missingCount = @([regex]::Matches($logAfterUndo, 'action=paths-file-missing')).Count
+    Assert-That ($missingCount -ge 2) "sync.log should record paths-file-missing again on undo (found $missingCount occurrences)"
+    Assert-That (-not (Test-Path -LiteralPath $sb.StateFile)) 'state.json should be cleared after undo even with paths.txt missing'
+} | Out-Null
+
+# ===========================================================================
+# T19 — the shipped paths.example.txt template, used as-is, must sync
+# nothing: its one example path is commented out, so a fresh install that
+# copies the template verbatim (without editing it) produces empty profiles,
+# not a crash or an accidentally-active path.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T19: shipped paths.example.txt template syncs zero paths as-is' -Body {
+    $sb = New-Sandbox -Label 'T19'
+    $templateSource = Join-Path $script:RepoRoot 'paths.example.txt'
+    Assert-That (Test-Path -LiteralPath $templateSource) "paths.example.txt should exist at $templateSource"
+    Copy-Item -LiteralPath $templateSource -Destination $sb.PathsFile -Force
+
+    $rc = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'T19Client'
+    Assert-That ($rc -eq 0) "exit code expected 0, got $rc"
+
+    $clientDir = Join-Path $sb.ProfilesDir 'T19Client'
+    Assert-That (Test-Path -LiteralPath $clientDir) 'client profile dir should still be created from the shipped template'
+    Assert-That (@(Get-ChildItem -LiteralPath $clientDir -Force -ErrorAction SilentlyContinue).Count -eq 0) 'the shipped template has no active (uncommented) paths, so the client profile dir must be empty'
+
+    # paths.txt exists (copied from the template) and has zero active paths,
+    # so there is nothing to log an error/skip about -- sync.log may
+    # legitimately not even be created (Write-SyncLog is only called for
+    # specific actions, never for a bare no-op success). Either way,
+    # paths-file-missing specifically must never appear.
+    $log = Read-TextFile $sb.LogFile
+    Assert-That (($null -eq $log) -or ($log -notmatch 'action=paths-file-missing')) 'paths.txt exists (copied from the template) -- paths-file-missing must NOT be logged'
 } | Out-Null
 
 # ===========================================================================
