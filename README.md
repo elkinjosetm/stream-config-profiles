@@ -30,13 +30,44 @@ The tool uses a two-phase strategy designed to survive crashes and unexpected di
 
 3. **Why this design**: If `undo` never fires (client disconnects without properly closing the app), the tool can recover at the next session start by saving the orphaned state first. You never lose a client's config, and your PC's config stays protected in `_local`.
 
+## The Easy Way: Install with the App
+
+1. **Download** `manager.ps1` and `Install.bat` from the latest Release
+2. **Double-click `Install.bat`** — a five-step wizard guides you through:
+   - **Welcome**: confirms the fixed program/data folder locations (neither is changeable)
+   - **Install files**: writes the engine, template, and a fresh `paths.txt` into the data folder
+   - **Connect to Vibepollo/Apollo**: edits its `.conf` file directly, no web UI needed
+   - **Watchdog protection**: logon/unlock protection is on by default, running entirely as you -- no administrator rights needed (see "About the Watchdog" below)
+   - **Done**
+3. **Done** — your next stream will use the profiles automatically. Afterwards, add/remove game config paths from the Main Window (Add File/Add Folder) -- reopen it any time by running `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` again.
+
+## File Locations
+
+- **Program file**: `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` (the GUI app -- this is also what you re-run to reopen the Main Window later)
+- **Data & engine**: `%LOCALAPPDATA%\stream-config-profiles\` contains:
+  - `sync-configs.ps1` (the core engine, called by Vibepollo)
+  - `paths.txt` (your game paths)
+  - `state.json`, `sync.log` (created automatically)
+  - `profiles\` (your client profiles and local backup)
+
+## About the Watchdog
+
+The "settle" watchdog fixes sessions that crashed or disconnected without properly closing, so your PC's local settings never get polluted by an orphaned streaming profile. It has two parts, registered independently:
+
+- **Logon / unlock** — on by default. Runs as you, no admin needed.
+- **Poll** — off by default; an optional periodic re-check every N minutes (min. 5).
+
+Both run entirely under your own account, so setting up or changing the watchdog never prompts for administrator rights. There is deliberately no boot-time (startup) task: local play after a reboot always requires logging in first, and the logon/unlock protection above already fires at exactly that moment. An earlier build did register a SYSTEM-level boot task, but it added an elevation surface (a privileged scheduled task pointing at a script in your ordinary, writable data folder) for no protection beyond what logon/unlock already provides, so it was removed. If you installed that earlier build, the app will try to clean up its leftover task the next time you unregister the watchdog or uninstall.
+
+Once configured, whichever parts you enabled run silently in the background.
+
 ## Quick Start
 
 ### File Layout
 
 ```
-stream-config-profiles\
-├── sync-configs.ps1       # Main executable (called by Vibepollo)
+%LOCALAPPDATA%\stream-config-profiles\
+├── sync-configs.ps1       # Core engine (called by Vibepollo)
 ├── paths.example.txt      # Template: copy this to paths.txt to get started
 ├── paths.txt              # YOUR CONFIG: one path per line (gitignored — safe across updates)
 ├── state.json             # Written by the script (session state)
@@ -71,9 +102,11 @@ Then open `paths.txt` in a text editor and list the full paths to game config fi
 - Lines starting with `#` and blank lines are ignored
 - Comments help you remember which game each path belongs to
 
-### Installation
+### Registration with Vibepollo
 
-See **install.md** for step-by-step instructions to register this tool with Vibepollo. You'll add two global prep commands (do/undo) in the Vibepollo web UI — the tool handles everything else automatically.
+**Method A (recommended): Use the app.** The `manager.ps1` wizard edits Vibepollo's `.conf` file directly with automatic backup, so it never depends on the web UI layout.
+
+**Method B: Manual setup.** See **install.md** for detailed step-by-step instructions if you prefer to register commands manually.
 
 ## Consequences & Behavior
 

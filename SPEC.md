@@ -29,12 +29,13 @@ edited profile, each client loads its own resolution correctly.
 - Zero dependencies: pure PowerShell 5.1+ (Windows built-in). No modules, no
   binaries, no installers.
 
-## Non-goals (v1) — backlog for v2
+## Non-goals (v1)
 
-- GUI (planned: WinForms in PowerShell, browse/add/remove paths only).
-- Per-path flags (e.g. mirror mode for folders).
-- Save/mod-set management (configs only).
-- Detecting whether a game is currently running.
+- Per-path flags (e.g. mirror mode for folders) — deferred to v2.
+- Save/mod-set management (configs only) — deferred to v2.
+- Detecting whether a game is currently running — deferred to v2.
+
+**Note:** GUI (WinForms, path browsing/add/remove) and settle mode (crash recovery at logon/unlock) are now v2 features; see v2 Implementation section.
 
 ## Files
 
@@ -194,10 +195,136 @@ duplicated command pairs exist.
   if results look inconsistent. FH6 has `UseDynamicOptimization` / `isDynamic`
   attributes that can override manual values.
 
-## Future (v2 backlog)
+## v2 Implementation
 
-- WinForms GUI (`manager.ps1`): list, add file, add folder, remove; writes
-  paths.txt only. Zero extra dependencies.
-- Per-path flags (`| mirror`).
-- Community release: README, MIT license, `.gitignore` for `profiles\`,
-  `state.json`, `sync.log`. Publish only once polished.
+Completed v1 backlog features and architectural contracts.
+
+### Settle Mode (Crash/Disconnect Recovery)
+
+A guarded recovery mode that fixes orphaned sessions at logon, unlock, and
+(optionally) on a poll interval. Guarantees the local PC's settings are never
+polluted by pending streaming profiles.
+
+**Trigger:** scheduled tasks with AtLogOn and OnUnlock (session-unlock) triggers, plus an
+optional periodic Poll trigger (default OFF). There is deliberately no AtStartup/Boot
+task -- see "Scheduled Tasks" below for why.
+
+**Behavior (settle guard v2):** Vibepollo/Apollo runs as an always-on service, so a
+matching process merely existing is NOT evidence that it is actively serving the
+pending session recorded in state.json — the same instance could easily have
+crashed and restarted, or state.json could predate the service's current run
+entirely. settle instead compares process *instance identity* (StartTime) against
+when the pending session began (state.json's `since`):
+- No state.json/pending → log 'settle-no-pending', exit 0, touch nothing
+- Pending, no process matches any host name pattern (vibepollo, apollo, sunshine;
+  override via `SCP_HOST_PROCESS_NAMES` env var for tests) → recover (nothing could
+  possibly be serving the session)
+- Pending, matching process(es) found → read the EARLIEST StartTime among them: if
+  it is LATER than `since`, every matching instance started after the pending
+  session began (a previous instance's crash/restart, not this session's host) →
+  recover anyway; otherwise an instance that was already running at/before `since`
+  could still be serving it → log 'settle-host-running', exit 0, touch nothing
+- StartTime unreadable (access denied) or `since` missing/unparseable → can't
+  safely tell instances apart → conservative no-op, log 'settle-host-unknown',
+  exit 0, touch nothing
+- "recover" = execute existing pending-recovery semantics (save disk → pending
+  client's profile) PLUS restore `_local` → disk and clear state.json; log all
+  actions with mode=settle; always exit 0
+
+**Scheduled Tasks:**
+- `StreamConfigProfiles-Settle-Logon` (AtLogOn + OnUnlock, user-level, default enabled)
+- `StreamConfigProfiles-Settle-Poll` (repetition every N minutes, N configurable min 5, default OFF)
+
+**No Boot task (architecture decision):** an earlier build also registered
+`StreamConfigProfiles-Settle-Boot` (AtStartup, SYSTEM/ServiceAccount principal at
+RunLevel Highest -- the only principal that fires an AtStartup trigger before anyone
+logs on). This product removes it entirely: local play after a reboot always requires
+a logon first, and the Logon task's AtLogOn trigger already fires at exactly that
+moment, covering the same window. Keeping an admin-level task whose action targets
+`<DATA>\sync-configs.ps1` -- a file living in the ordinary user's own writable
+profile, rewritten in place by every unelevated `install`/reinstall -- bought zero
+additional protection over Logon alone while adding a real elevation-and-escalation
+surface (anything that can write to DATA while the Boot task exists gets SYSTEM
+execution at the next restart). Because every remaining watchdog task is purely
+user-level (Interactive principal, the resolved caller's own account),
+registering/unregistering the watchdog never needs elevation -- elevation in this
+tool is now reserved solely for conf editing/service restart and the uninstall paths
+that touch Program Files/protected locations.
+`Unregister-Watchdog` still best-effort-removes a legacy `StreamConfigProfiles-Settle-Boot`
+task if one is found (cleanup for anyone who installed that interim build); since
+deleting an admin-level task from an unelevated process is expected to fail, that
+outcome is swallowed rather than surfaced as an overall failure.
+
+All actions execute: `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "<DATA>\sync-configs.ps1" -Mode settle`
+
+### Install Layout (v2 Contract)
+
+Two-folder design:
+- **Program folder:** `%LOCALAPPDATA%\Programs\stream-config-profiles\` holds `manager.ps1` only
+- **Data folder:** `%LOCALAPPDATA%\stream-config-profiles\` holds `sync-configs.ps1` (engine), `paths.example.txt`, `paths.txt`, `state.json`, `sync.log`, `profiles\`
+
+Engine stays co-located with its data — `$PSScriptRoot` logic untouched. Vibepollo/Apollo
+registration points at `<DATA>\sync-configs.ps1`.
+
+### Manager.ps1 Architecture
+
+Single self-contained file, structured into regions:
+
+- **#region Core:** Headless functions (no GUI wiring). All manager core functions take explicit path parameters (no hardcoded env lookups inside logic) so tests can drive them against sandbox dirs cross-platform.
+- **#region Gui:** WinForms wiring. GUI never runs elevated wholesale; elevation only for specific admin operations (conf edit, service restart, uninstall paths that touch Program Files/protected locations) via `Start-Process -Verb RunAs` re-entry. Registering/unregistering the watchdog never routes through this -- every watchdog task is user-level, so there is nothing to elevate.
+- **#region EmbeddedPayload:** Two marked here-string slots, EMPTY in the repo (marked `<#PAYLOAD:ENGINE#>` and `<#PAYLOAD:TEMPLATE#>`).
+
+**Dev mode:** When payload slots are empty, manager loads `sync-configs.ps1` and `paths.example.txt` from its own script directory (the repo).
+
+**Release mode:** Build inlines file contents into slots, producing self-contained `dist/manager.ps1`.
+
+### Headless Actions & CLI Surface
+
+`manager.ps1 -Action <value>` with no GUI:
+
+- `install` — lays down the file layout only: creates PROGRAM/DATA, writes the engine + template into DATA, creates `paths.txt` from the template if absent, copies `manager.ps1` into PROGRAM. It does not touch Vibepollo registration or the watchdog -- those are separate actions (the wizard simply calls all of them in sequence across its steps).
+- `register-vibepollo` — edit Vibepollo's `.conf`, add our entry with automatic backup
+- `unregister-vibepollo` — remove our entry from `.conf` (leaves the `.bak` file on disk for manual recovery; does not automatically restore from it)
+- `register-watchdog` — create scheduled tasks (Logon always; Poll with default interval or specified, opt-in). Never needs elevation -- every task registered is user-level.
+- `unregister-watchdog` — delete scheduled tasks (Logon, Poll), plus best-effort-remove a legacy Boot task if one is found. Never needs elevation for the current task set; the legacy Boot cleanup is attempted regardless but its failure never fails the overall call.
+- `uninstall` — cleanup: unregister-watchdog, unregister-vibepollo (if a conf path is known/found), restart the host service, remove the program folder (and the data folder if `-RemoveData` is passed)
+
+Supporting params (actual, as implemented): `-ProgramDir`, `-DataDir`, `-ConfPath`, `-IncludePoll`, `-PollMinutes`, `-RemoveData`, `-ManagerScriptPath`, `-UserId`, `-NoRun`. There is no `-IncludeBoot` -- the product has no boot-time task (see the Settle Mode section above). `-DataDir` is not user-changeable in the wizard (there is nowhere contract-compliant to persist a custom choice, since PROGRAM is fixed to hold `manager.ps1` only -- see the Install Layout contract above); it always resolves to the fixed default unless the param is passed explicitly (tests, elevation re-entry). `-ConfPath` falls back to a fresh `Find-HostConf` auto-detection when omitted.
+
+Running with no `-Action` opens the GUI (wizard on first run, main window if installed).
+
+### Vibepollo/Apollo Registration (Conf-Edit Contract)
+
+Manager edits the `.conf` file directly, never the web UI:
+- `.conf` uses key=value lines; global prep commands live in a `global_prep_cmd` key whose value is a JSON array of `{do, undo, elevated}` objects
+- Our entry identified by its do-command containing the engine path
+- Always back up the conf (timestamped `.bak` alongside) before writing
+- Merge with existing entries (never clobber others)
+- Removal deletes only our entry
+
+Service restart via Get-Service name patterns (`*vibepollo*`, `*apollo*`, `*sunshine*`) — if none found, surface 'restart manually'.
+
+### Watchdog Task Set
+
+Two scheduled tasks, both execute:
+```
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "<DATA>\sync-configs.ps1" -Mode settle
+```
+
+- `StreamConfigProfiles-Settle-Logon`: AtLogOn + a real session-unlock trigger (`MSFT_TaskSessionStateChangeTrigger`, StateChange=SessionUnlock), Interactive principal under the resolved user, default enabled
+- `StreamConfigProfiles-Settle-Poll`: Repetition trigger (every N minutes), Interactive principal under the resolved user, configurable (min 5 minutes), default OFF
+
+There is no `StreamConfigProfiles-Settle-Boot` task -- see the Settle Mode section
+above ("No Boot task") for the architecture decision. Both remaining tasks are
+Interactive/user-level, so `register-watchdog`/`unregister-watchdog` never need
+elevation. `unregister-watchdog` still best-effort-attempts to delete a legacy
+`StreamConfigProfiles-Settle-Boot` task (present only if the user installed an
+interim build that registered one); that attempt's own success/failure never
+affects the overall result.
+
+### Release Pipeline
+
+1. Build: Inline `sync-configs.ps1` and `paths.example.txt` into `manager.ps1` payload slots → `dist/manager.ps1`
+2. Generate `Install.bat`: wrapper that sets execution policy and runs the wizard
+3. Package for release: `manager.ps1`, `Install.bat`, README snippet (quick-start)
+4. CI/CD: matrix across Windows PowerShell 5.1 + pwsh 7, verify both payload modes (dev + release)

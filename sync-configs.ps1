@@ -13,6 +13,23 @@
       - On "undo" (session end): saves the ending client's disk state into
         its profile, restores profiles\_local back onto disk, and clears the
         pending-session state file.
+      - On "settle" (watchdog: logon/unlock/poll, no Vibepollo/Apollo session
+        confirmed in progress): if state.json shows no pending session, does
+        nothing. Vibepollo/Apollo runs as an always-on service, so a
+        streaming-host process (Vibepollo/Apollo/Sunshine) merely existing is
+        NOT evidence the pending session is still active -- if one is found,
+        its earliest StartTime is compared against state.json's 'since': a
+        StartTime later than 'since' means every matching process started
+        after this session began (a previous instance's crash/restart, not
+        this session's host) and the pending session is recovered anyway; a
+        StartTime at/before 'since' means an instance that could still be
+        serving the session, so settle does nothing. An unreadable StartTime
+        or an unparseable/missing 'since' is treated conservatively as "do
+        nothing" rather than guessed either way. Recovering performs the
+        same crash-recovery save as a "do" would (disk -> pending client's
+        profile), then ALSO restores profiles\_local back onto disk and
+        clears state.json, since -- unlike "do" -- there is no incoming
+        client to hand the disk over to.
     All companion files (paths.txt, state.json, sync.log, profiles\) are
     resolved relative to $PSScriptRoot so the script can be invoked from any
     working directory.
@@ -21,7 +38,9 @@
     to load all functions without executing Main.
 
 .PARAMETER Mode
-    'do' (session start) or 'undo' (session end).
+    'do' (session start), 'undo' (session end), or 'settle' (watchdog pass:
+    reconciles any pending crash/disconnect session when no client is
+    actively connected).
 
 .PARAMETER NoRun
     When set, the script defines its functions and returns without calling
@@ -295,6 +314,20 @@ function Read-SyncState {
         $since = $null
         if ($parsed.PSObject.Properties.Match('since').Count -gt 0) {
             $since = $parsed.since
+            if ($since -is [datetime]) {
+                # pwsh 7's ConvertFrom-Json auto-converts ISO-8601-looking
+                # JSON string values into [datetime] instances; Windows
+                # PowerShell 5.1's ConvertFrom-Json does not and keeps the
+                # raw string. Left alone, a later bare [string] cast on this
+                # value would render the pwsh 7 [datetime] through
+                # PowerShell's invariant general format -- losing the
+                # sub-second component and the offset/Kind marker that
+                # ConvertFrom-RoundTripTimestamp needs -- while 5.1 keeps
+                # full 'o' precision. Round-trip it back through the same
+                # 'o' format Write-SyncState uses so both hosts hand
+                # identical text to downstream parsing.
+                $since = $since.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+            }
         }
 
         $localBackedUp = $false
@@ -541,7 +574,161 @@ function Restore-PathsFromLocal {
 }
 
 # ---------------------------------------------------------------------------
-# do / undo state machine
+# Streaming-host process detection (used by settle)
+# ---------------------------------------------------------------------------
+
+function Get-HostProcessNames {
+    # Name patterns used to detect whether a streaming-host process is
+    # currently running. Defaults to substring-style wildcard matches for
+    # vibepollo/apollo/sunshine. Tests (and real deployments that rename the
+    # host binary) can override the whole list via SCP_HOST_PROCESS_NAMES --
+    # a comma-separated list of Get-Process -Name patterns used verbatim (no
+    # wildcards added), so a test can pin an exact, known-alive process name.
+    param(
+        [string]$EnvOverride
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($EnvOverride)) {
+        $parts = $EnvOverride -split ','
+        $result = New-Object System.Collections.Generic.List[string]
+        foreach ($part in $parts) {
+            $trimmed = $part.Trim()
+            if (-not [string]::IsNullOrEmpty($trimmed)) {
+                $result.Add($trimmed)
+            }
+        }
+        return $result.ToArray()
+    }
+
+    return @('*vibepollo*', '*apollo*', '*sunshine*')
+}
+
+function Get-HostProcessInstanceInfo {
+    # CONTRACT A (settle guard v2): the streaming host (Vibepollo/Apollo) runs
+    # as an always-on service, so mere process existence is NOT evidence of
+    # an active session -- Invoke-Settle needs to know whether any matching
+    # process is the SAME instance that was already running when the pending
+    # session began, or a later one (crash/restart) that cannot possibly be
+    # the one that owns it.
+    #
+    # Walks every pattern in $NamePatterns exactly like the previous
+    # boolean-only Test-HostProcessRunning did (each pattern probed
+    # independently with -ErrorAction SilentlyContinue, since Get-Process on
+    # an unmatched pattern raises a non-terminating "no process found" error
+    # under $ErrorActionPreference = 'Stop' unless suppressed), but instead
+    # of a bare boolean, returns the EARLIEST StartTime among every matching
+    # process -- Invoke-Settle compares that against state.json's 'since' to
+    # tell a still-running instance from a crashed/restarted one.
+    #
+    # A given process's StartTime can throw (e.g. access-denied reading a
+    # process not owned by the current user) -- caught per-process so one
+    # unreadable StartTime doesn't lose the whole scan, but any such failure
+    # sets HasUnknownStartTime so the caller falls back to a conservative
+    # no-op instead of trusting a possibly-wrong earliest value (the process
+    # whose StartTime couldn't be read might in fact be the true earliest).
+    # Get-Process itself failing for a pattern gets the same treatment (see
+    # the catch below) -- Invoke-Settle checks HasUnknownStartTime
+    # independent of Found for exactly this reason.
+    param(
+        [string[]]$NamePatterns
+    )
+
+    $found = $false
+    $earliest = $null
+    $hasUnknownStartTime = $false
+
+    foreach ($pattern in $NamePatterns) {
+        if ([string]::IsNullOrWhiteSpace($pattern)) { continue }
+        $procs = $null
+        try {
+            $procs = Get-Process -Name $pattern -ErrorAction SilentlyContinue
+        }
+        catch {
+            # Get-Process itself failed for this pattern (e.g. a
+            # performance-counter/WMI problem, a policy-restricted process
+            # list) -- this is NOT the same as "no process matches this
+            # pattern": the enumeration simply couldn't be trusted. Treat it
+            # like an unreadable StartTime (HasUnknownStartTime) rather than
+            # silently contributing nothing, so a systemic enumeration
+            # failure can't masquerade as "the streaming host definitely
+            # isn't running" and drive Invoke-Settle into recovering over a
+            # possibly-live session.
+            $procs = $null
+            $hasUnknownStartTime = $true
+        }
+        if (-not $procs) { continue }
+
+        foreach ($proc in $procs) {
+            $found = $true
+            try {
+                $startTime = $proc.StartTime
+                if ($null -eq $earliest -or $startTime -lt $earliest) {
+                    $earliest = $startTime
+                }
+            }
+            catch {
+                $hasUnknownStartTime = $true
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Found               = $found
+        EarliestStartTime   = $earliest
+        HasUnknownStartTime = $hasUnknownStartTime
+    }
+}
+
+function ConvertFrom-RoundTripTimestamp {
+    # Parses an ISO-8601 timestamp written by Write-SyncState
+    # ((Get-Date).ToString('o')) back into a [DateTime]. Uses the invariant
+    # culture together with DateTimeStyles.RoundtripKind -- the pairing .NET
+    # documents for round-tripping 'o'-format strings -- so parsing behaves
+    # identically on Windows PowerShell 5.1 (.NET Framework) and pwsh 7+
+    # (.NET) regardless of the current culture/locale. Returns $null for a
+    # null/empty/unparseable value rather than throwing, so callers can treat
+    # "unparseable" the same as "missing".
+    #
+    # RoundtripKind's whole point is to PRESERVE the parsed Kind rather than
+    # normalize it: a 'Z'-suffixed timestamp comes back Kind=Utc, one with a
+    # numeric offset comes back Kind=Local. Write-SyncState only ever emits
+    # the latter (Get-Date is local), so normal product-written state.json
+    # round-trips fine without help -- but state.json is untrusted input
+    # (hand-edited, restored from a backup, written by a future version),
+    # and callers here compare the result directly (via <=) against
+    # Process.StartTime, which .NET always returns as Kind=Local. DateTime
+    # comparison operators compare raw Ticks and ignore Kind entirely, so a
+    # Utc-Kind result compared against a Local-Kind StartTime is silently
+    # off by the machine's UTC offset. Normalize to local Kind here, once,
+    # so every caller gets a value that is directly comparable to
+    # Process.StartTime regardless of how 'since' was written.
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    $result = [DateTime]::MinValue
+    $ok = [DateTime]::TryParse(
+        $Text,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::RoundtripKind,
+        [ref]$result)
+
+    if (-not $ok) {
+        return $null
+    }
+
+    if ($result.Kind -eq [System.DateTimeKind]::Utc) {
+        return $result.ToLocalTime()
+    }
+    return $result
+}
+
+# ---------------------------------------------------------------------------
+# do / undo / settle state machine
 # ---------------------------------------------------------------------------
 
 function Test-PathUnderRoot {
@@ -694,6 +881,124 @@ function Invoke-Undo {
     Clear-SyncState -StateFile $StateFile -LogFile $LogFile -ModeLabel 'undo' -Client $Client
 }
 
+function Invoke-Settle {
+    # Watchdog pass (logon/unlock/poll -- there is deliberately no boot-time
+    # trigger, see CONTRACT B / SPEC.md), run with no client identified
+    # via env vars -- settle acts purely on whatever state.json records, not
+    # on APOLLO_CLIENT_NAME/SUNSHINE_CLIENT_NAME.
+    #
+    # CONTRACT A (settle guard v2): Vibepollo/Apollo runs as an always-on
+    # service, so mere process existence is NOT evidence of an active
+    # session -- a pending state.json could just as easily be left behind by
+    # a session whose host process crashed/restarted, with the always-on
+    # service now on a brand-new instance that never touched that session.
+    #
+    #   1. No pending session (state.json absent, or present with no usable
+    #      activeClient -- this also covers a corrupt/truncated state.json,
+    #      since Read-SyncState already normalizes that to activeClient =
+    #      $null) -> log 'settle-no-pending', touch nothing else.
+    #   2. Pending session, no process matches any host name pattern ->
+    #      recover (step 5 below) -- nothing could be serving this session.
+    #   3. Pending session, matching process(es) found -> compare the
+    #      EARLIEST StartTime among them against state.json's 'since'. If
+    #      that StartTime is LATER than 'since', every matching instance
+    #      started after the pending session began, so none of them can be
+    #      the one that owns it -- it belongs to a previous host instance
+    #      (crash/restart) -> recover (step 5 below). Otherwise, an instance
+    #      that was already running at/before 'since' really could still be
+    #      serving this session -> log 'settle-host-running', touch nothing.
+    #   4. StartTime unreadable (access denied), the process enumeration
+    #      itself failed (e.g. a performance-counter/WMI problem -- treated
+    #      the same as an unreadable StartTime rather than as "no process
+    #      matches", since a failed read is not evidence of absence), or
+    #      'since' missing/unparseable -> can't safely tell instances apart
+    #      -> conservative no-op, log 'settle-host-unknown', touch nothing.
+    #      This check runs whenever HasUnknownStartTime is set, independent
+    #      of Found, precisely because an enumeration failure can leave
+    #      Found=$false with no way to know whether a process was missed.
+    #   5. "recover" = exactly the "do" pending-recovery step (save disk ->
+    #      pending client's profile, reusing the same helpers and the same
+    #      Get-SafeClientName/Test-PathUnderRoot hardening against untrusted
+    #      state.json content), PLUS -- because unlike "do" there is no
+    #      incoming client to hand the disk over to -- restore profiles\
+    #      _local back onto disk and clear state.json, exactly like "undo"'s
+    #      second half.
+    param(
+        [string[]]$Paths,
+        [string]$ProfilesRoot,
+        [string]$StateFile,
+        [string]$LogFile,
+        [string[]]$HostProcessNames
+    )
+
+    $state = Read-SyncState -StateFile $StateFile -LogFile $LogFile -ModeLabel 'settle' -Client 'unknown'
+
+    if (-not $state.activeClient) {
+        Write-SyncLog -LogFile $LogFile -ModeLabel 'settle' -Client 'unknown' -Action 'settle-no-pending' -Path $StateFile
+        return
+    }
+
+    $hostInfo = Get-HostProcessInstanceInfo -NamePatterns $HostProcessNames
+
+    # Gated on HasUnknownStartTime as well as Found: a process-enumeration
+    # failure (see Get-HostProcessInstanceInfo's catch) sets
+    # HasUnknownStartTime with Found still $false, since the failed pattern
+    # contributed no processes either way. That combination must still take
+    # the conservative no-op path below rather than falling through to
+    # unconditional recovery as a genuine "no process matches" would.
+    if ($hostInfo.Found -or $hostInfo.HasUnknownStartTime) {
+        $sinceTime = ConvertFrom-RoundTripTimestamp -Text ([string]$state.since)
+
+        if ($hostInfo.HasUnknownStartTime -or $null -eq $sinceTime) {
+            # Can't reliably distinguish "the same instance is still
+            # running this session" from "a previous instance left this
+            # behind" -- conservative no-op rather than risk settling a
+            # session out from under a host that may still be serving it.
+            Write-SyncLog -LogFile $LogFile -ModeLabel 'settle' -Client 'unknown' -Action 'settle-host-unknown' -Path $StateFile
+            return
+        }
+
+        if ($hostInfo.EarliestStartTime -le $sinceTime) {
+            # At least one matching instance was already running at/before
+            # the pending session began -- it could still be serving it.
+            Write-SyncLog -LogFile $LogFile -ModeLabel 'settle' -Client 'unknown' -Action 'settle-host-running' -Path $StateFile
+            return
+        }
+        # else: every matching instance started AFTER the pending session
+        # began, so none of them can be the one serving it -- fall through
+        # to recovery below exactly as if no process had matched at all.
+    }
+
+    $pendingClientSafe = Get-SafeClientName -RawName $state.activeClient
+    $pendingDir = $null
+    if ($pendingClientSafe) {
+        $candidate = Join-Path $ProfilesRoot $pendingClientSafe
+        if (Test-PathUnderRoot -RootPath $ProfilesRoot -CandidatePath $candidate) {
+            $pendingDir = $candidate
+        }
+    }
+
+    if ($null -eq $pendingDir) {
+        # activeClient sanitized to nothing usable, or resolved outside
+        # profiles\ -- do not write anywhere on the strength of untrusted
+        # state.json content. Leave state.json in place (same conservative
+        # choice Invoke-Do makes) rather than clearing it on the back of an
+        # invalid record.
+        Write-SyncLog -LogFile $LogFile -ModeLabel 'settle' -Client 'unknown' -Action 'state-invalid-client' -Path ([string]$state.activeClient)
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $pendingDir)) {
+        New-Item -ItemType Directory -Path $pendingDir -Force | Out-Null
+    }
+    Backup-PathsToProfile -Paths $Paths -ProfileDir $pendingDir -LogFile $LogFile -ModeLabel 'settle' -Client $pendingClientSafe -ActionName 'save-pending'
+
+    $localDir = Join-Path $ProfilesRoot '_local'
+    Restore-PathsFromLocal -Paths $Paths -LocalProfileDir $localDir -LogFile $LogFile -ModeLabel 'settle' -Client $pendingClientSafe
+
+    Clear-SyncState -StateFile $StateFile -LogFile $LogFile -ModeLabel 'settle' -Client $pendingClientSafe
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -716,7 +1021,7 @@ function Main {
         $scriptRoot = (Get-Location).Path
     }
 
-    if ($Mode -ne 'do' -and $Mode -ne 'undo') {
+    if ($Mode -ne 'do' -and $Mode -ne 'undo' -and $Mode -ne 'settle') {
         # No/invalid mode: nothing to do, but make it diagnosable. Note:
         # -Mode intentionally has no [ValidateSet] -- PowerShell parameter
         # validation runs before the script body (before this try/catch and
@@ -726,6 +1031,27 @@ function Main {
         # to prevent.
         $logFileForBadMode = Join-Path $scriptRoot 'sync.log'
         Write-SyncLog -LogFile $logFileForBadMode -ModeLabel ([string]$Mode) -Client 'unknown' -Action 'invalid-mode' -Path ''
+        return
+    }
+
+    if ($Mode -eq 'settle') {
+        # settle is driven by the watchdog (logon/unlock/poll -- no boot-time
+        # trigger, see CONTRACT B), not by
+        # a Vibepollo/Apollo hook -- it never has APOLLO_CLIENT_NAME /
+        # SUNSHINE_CLIENT_NAME set, and acts purely on state.json's own
+        # recorded pending client. Deliberately does NOT pre-create
+        # profiles\ here (unlike do/undo below): the no-pending and
+        # host-running branches must touch nothing on disk at all, and
+        # Invoke-Settle creates whatever directories it actually needs only
+        # once it has decided a save/restore is really happening.
+        $pathsFile = Join-Path $scriptRoot 'paths.txt'
+        $stateFile = Join-Path $scriptRoot 'state.json'
+        $logFile = Join-Path $scriptRoot 'sync.log'
+        $profilesRoot = Join-Path $scriptRoot 'profiles'
+
+        $paths = Get-ConfigPaths -PathsFile $pathsFile
+        $hostProcessNames = Get-HostProcessNames -EnvOverride $env:SCP_HOST_PROCESS_NAMES
+        Invoke-Settle -Paths $paths -ProfilesRoot $profilesRoot -StateFile $stateFile -LogFile $logFile -HostProcessNames $hostProcessNames
         return
     }
 

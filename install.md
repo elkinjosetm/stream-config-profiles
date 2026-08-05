@@ -2,23 +2,47 @@
 
 ## Prerequisites
 
-- Windows PC running **Vibepollo 1.17.0 or later** (Apollo fork for game streaming; UI steps below verified on v1.18.3)
+- Windows PC running **Vibepollo 1.17.0 or later** (Apollo fork for game streaming)
 - Basic familiarity with copy/paste and text editing
-- The script itself never needs to run as Administrator — Vibepollo runs it unattended at every stream start/end, and an elevation (UAC) prompt would silently block that. You only need elevated access at all if you choose to place the `stream-config-profiles` folder somewhere that requires it (e.g. directly under `C:\` or inside `Program Files`); picking a location under your own user profile avoids this entirely.
 
-## Installation Steps
+## Method A: Using the App (Recommended)
 
-### Step 1: Place the Folder
+The easiest way: download `manager.ps1` and `Install.bat` from the latest Release and run the wizard. You do not create or choose any folder yourself -- both the program and data locations are fixed (see File Locations in README.md) and the wizard just shows them to you.
 
-Download or clone the `stream-config-profiles` folder and place it at:
+### Installation Steps
 
-```
-C:\stream-config-profiles
-```
+1. **Download** the latest `manager.ps1` and `Install.bat` from Releases, into any folder (e.g. your Downloads folder -- they don't need to live anywhere permanent; `Install.bat` copies `manager.ps1` into the real program folder for you)
+2. **Double-click `Install.bat`** — a five-step wizard appears:
+   - **Welcome**: shows the fixed program folder (`%LOCALAPPDATA%\Programs\stream-config-profiles\`) and fixed data folder (`%LOCALAPPDATA%\stream-config-profiles\`) — neither is editable here
+   - **Install files**: writes `sync-configs.ps1`, `paths.example.txt`, and a fresh `paths.txt` (copied from the template automatically -- no manual copy step) into the data folder, and copies `manager.ps1` into the program folder
+   - **Connect to Vibepollo/Apollo**: click **Connect** to edit its `.conf` file directly (automatic backup, no web UI needed) — Vibepollo/Apollo is usually auto-detected; browse to the file manually if not
+   - **Watchdog protection**: logon/unlock protection is checked by default, and an optional periodic poll checkbox is available too — both run entirely as you, so this step never needs administrator rights (see README.md's "About the Watchdog" for why there's no boot-time option)
+   - **Done**
+3. **Add your game config paths.** The wizard does not ask you to hand-edit `paths.txt` — after Setup finishes, the **Main Window** opens automatically (or reopen it any time by running `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1`). Use its **Add File...** / **Add Folder...** buttons to add each game's config path; **Remove Selected** to remove one.
+4. **Done** — your next stream will use profiles automatically
 
-**Note:** You can use any location on your PC, but all commands in the following steps assume `C:\stream-config-profiles`. If you place it elsewhere (e.g., `D:\MyTools\stream-config-profiles`), replace `C:\stream-config-profiles` with your actual path in all commands below.
+### Verify Installation
+
+1. **Start a stream** from any client
+2. **Check that folders appeared:**
+   - A `profiles\_local\` folder (your PC's original config)
+   - A folder named after your client (e.g., `profiles\LivingRoomTV\`)
+3. **Check the log:**
+   - Open `sync.log` and verify it shows real activity (not `action=paths-file-missing`)
+   - If missing, you skipped the paths.txt step — go back and add your game paths
+4. **Test:** Play the game, change settings, and end the stream
+   - If you quit the client app properly, your local settings restore immediately
+   - If you disconnect without quitting, your settings restore on the next stream (crash recovery)
 
 ---
+
+## Method B: Manual Setup (Appendix)
+
+For auditors, minimalists, or when the app isn't available.
+
+### Step 1: Place the Files
+
+Download or clone the repo and place it at any location (e.g., `C:\stream-config-profiles`). Commands below assume this path — substitute your actual location if different.
 
 ### Step 2: Configure Your Game Paths
 
@@ -42,8 +66,6 @@ Then open the `paths.txt` file in any text editor (Notepad is fine) and add the 
 **Finding your game's config path:** Every game stores its configuration in a different location. A good resource is [PCGamingWiki](https://www.pcgamingwiki.com) — each game's page has a "Configuration file(s) location" section listing the exact path.
 
 See `README.md` for more details on the format.
-
----
 
 ### Step 3: Register Commands in Vibepollo
 
@@ -95,8 +117,6 @@ After restarting, check that:
 - The **"Do Command"** and **"Undo Command"** fields in your Command Preparations row both contain the correct commands
 - No duplicate pairs exist (you should have exactly one row with both commands)
 
----
-
 ### ⚠️ Important Warning: Check for Duplicates
 
 **Duplicated command pairs corrupt your game profiles.** Ideally do this check before saving in Step 3c above — but if you've already saved and restarted (Steps 3c-3e), it's not too late: go back and check now, before your first stream:
@@ -110,8 +130,6 @@ After restarting, check that:
    If you see more rows, or if this pair is duplicated, remove the extras and keep only one row.
 
 3. **Save** and verify (as described in Steps 3c, 3d and 3e) to apply changes.
-
----
 
 ### Step 4: Verify Installation Works
 
@@ -140,11 +158,21 @@ If case (a) works as expected, installation is complete! Case (b) is just there 
 
 ## Uninstalling
 
-If you need to remove this tool:
+### If You Used Method A (the App)
+
+1. **Run** `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` to open the Main Window, then click **Disconnect all / Uninstall...** at the bottom
+2. Confirm, and choose whether to also delete your data folder (configured paths, saved profiles, log) -- declining leaves it in place
+3. The app removes the Vibepollo/Apollo registration, the watchdog scheduled tasks, and the program folder (and, if you chose to, the data folder)
+
+### If You Used Method B (Manual Setup)
 
 1. **Open Vibepollo** → **Configuration** → **Command Preparations** (see Step 3a)
 2. **Delete the single row** whose **Do Command** and **Undo Command** fields both point to `sync-configs.ps1` (trash icon), then **Save** and restart Vibepollo
-3. **Delete the folder** `C:\stream-config-profiles` from your disk
+3. **(Optional) Remove scheduled tasks** if you set up the watchdog:
+   - Open **Task Scheduler** and delete any tasks named `StreamConfigProfiles-Settle-*`
+4. **Delete the data folder** `C:\stream-config-profiles` from your disk
+
+### General Notes
 
 Your game settings are safe as long as your last session ended cleanly (the client app was properly quit, so `undo` ran and restored your local config to disk). If your last stream instead ended by disconnect rather than quitting the client, `undo` never ran and your disk may still hold that client's settings — start one more stream and properly quit it before uninstalling, so your local config is restored first. You can also check `state.json` in the install folder: if it exists and lists an `activeClient`, a session is still pending.
 

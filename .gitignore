@@ -3,3 +3,4 @@ state.json
 state.json.tmp
 sync.log
 paths.txt
+dist/

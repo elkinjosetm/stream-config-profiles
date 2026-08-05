@@ -8,7 +8,7 @@
     drives the real script via a child PowerShell process exactly the way
     Vibepollo would (env var + -Mode do|undo), and asserts on-disk /
     profile / state.json outcomes for every scenario in the task brief
-    (T1..T18). Prints a PASS/FAIL table and exits non-zero if anything
+    (T1..T24). Prints a PASS/FAIL table and exits non-zero if anything
     failed.
 
     The child host mirrors whichever host is running this harness: PSEdition
@@ -96,6 +96,15 @@ else {
     if (Test-IsWindowsPlatform) { $pwshLeaf = 'pwsh.exe' }
     $script:PwshExe = Join-Path $PSHOME $pwshLeaf
 }
+
+# Name (no extension/path) of the interpreter binary this harness launches
+# children with -- e.g. 'pwsh' or 'powershell'. This process is, by
+# construction, alive for the whole run of this harness (it's what's running
+# THIS script, and it's also what every child -Mode settle scenario below
+# gets launched with), so it doubles as a reliably-alive "streaming host"
+# name for T21's SCP_HOST_PROCESS_NAMES override without hardcoding a
+# platform-specific process name.
+$script:HostAliveProcessName = [System.IO.Path]::GetFileNameWithoutExtension($script:PwshExe)
 
 # ---------------------------------------------------------------------------
 # Sandbox root + robocopy shim
@@ -323,12 +332,15 @@ function Set-PathsFile {
 }
 
 function Invoke-Sync {
-    # Drives the real script exactly as Vibepollo would: a fresh child
-    # process, -Mode do|undo, APOLLO_CLIENT_NAME set (or deliberately
-    # absent) per scenario. Returns the child process exit code.
+    # Drives the real script exactly as Vibepollo (do|undo) or the watchdog
+    # (settle) would: a fresh child process, -Mode do|undo|settle,
+    # APOLLO_CLIENT_NAME set (or deliberately absent) per scenario. Returns
+    # the child process exit code. settle never has a client env var set in
+    # real use, but callers are free to pass one anyway -- Get-ClientNameRaw
+    # is simply never consulted by settle.
     param(
         $Sandbox,
-        [ValidateSet('do', 'undo')][string]$Mode,
+        [ValidateSet('do', 'undo', 'settle')][string]$Mode,
         [string]$ApolloClient = $null,
         [string]$SunshineClient = $null
     )
@@ -347,6 +359,79 @@ function Invoke-Sync {
     # is permissive. pwsh accepts (and ignores) the switch on every platform.
     & $script:PwshExe -NoProfile -ExecutionPolicy Bypass -File $Sandbox.ScriptPath -Mode $Mode | Out-Null
     return $LASTEXITCODE
+}
+
+function Start-DecoyHostProcess {
+    # Spawns a short-lived background process for T23 (CONTRACT A: settle
+    # guard v2's StartTime-vs-'since' instance check) under a distinctive,
+    # test-only executable name, so a Get-Process -Name pattern (via
+    # SCP_HOST_PROCESS_NAMES) can match it EXCLUSIVELY -- unlike T21's
+    # $script:HostAliveProcessName trick (this harness's own long-lived
+    # interpreter process, whose whole point is that it started long before
+    # any test's pending state existed), T23 specifically needs a process
+    # whose StartTime is LATER than a given 'since'. Matching on the
+    # interpreter's own process name would also match this still-running
+    # harness process itself (same binary), whose much-earlier StartTime
+    # would corrupt the "earliest StartTime" comparison Get-HostProcessInstanceInfo
+    # performs -- so this spawns something with a name nothing else on the
+    # box will ever share.
+    #
+    # Achieved by copying a small, always-present OS binary that blocks for
+    # a few seconds (/bin/sleep on Linux/macOS; PING.EXE on Windows, given a
+    # target/count that keeps it busy without needing input) to a decoy file
+    # name unique to this test run, then launching that copy directly --
+    # Get-Process -Name reports the process under the name of the actual
+    # file that was executed, not the original binary it was copied from.
+    #
+    # Returns a PSCustomObject { Process; Name; Path }. The caller owns
+    # cleanup: Stop-Process the Process (best-effort, it may have already
+    # exited) and Remove-Item the Path.
+    param(
+        [string]$DecoyName,
+        [int]$Seconds = 6
+    )
+
+    $decoyDir = Join-Path $script:TempRoot 'decoy'
+    if (-not (Test-Path -LiteralPath $decoyDir)) {
+        New-Item -ItemType Directory -Path $decoyDir -Force | Out-Null
+    }
+
+    if (Test-IsWindowsPlatform) {
+        $decoyPath = Join-Path $decoyDir ($DecoyName + '.exe')
+        $pingPath = Join-Path $env:SystemRoot 'System32\PING.EXE'
+        Copy-Item -LiteralPath $pingPath -Destination $decoyPath -Force
+        # '-n' pings 127.0.0.1 (count+1) times, ~1 second apart, needs no
+        # stdin/console interaction -- unlike timeout.exe/choice.exe.
+        $proc = Start-Process -FilePath $decoyPath -ArgumentList @('-n', [string]($Seconds + 1), '127.0.0.1') -WindowStyle Hidden -PassThru
+    }
+    else {
+        $decoyPath = Join-Path $decoyDir $DecoyName
+        Copy-Item -LiteralPath '/bin/sleep' -Destination $decoyPath -Force
+        & chmod +x $decoyPath 2>$null | Out-Null
+        $proc = Start-Process -FilePath $decoyPath -ArgumentList @([string]$Seconds) -PassThru
+    }
+
+    return [PSCustomObject]@{
+        Process = $proc
+        Name    = $DecoyName
+        Path    = $decoyPath
+    }
+}
+
+function Stop-DecoyHostProcess {
+    # Best-effort cleanup counterpart to Start-DecoyHostProcess.
+    param($Decoy)
+
+    if ($null -eq $Decoy) { return }
+    try {
+        if ($Decoy.Process -and -not $Decoy.Process.HasExited) {
+            Stop-Process -Id $Decoy.Process.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        # Process may have already exited on its own -- fine either way.
+    }
+    Remove-Item -LiteralPath $Decoy.Path -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1083,264 @@ Invoke-Scenario -Name 'T19: shipped paths.example.txt template syncs zero paths 
     # paths-file-missing specifically must never appear.
     $log = Read-TextFile $sb.LogFile
     Assert-That (($null -eq $log) -or ($log -notmatch 'action=paths-file-missing')) 'paths.txt exists (copied from the template) -- paths-file-missing must NOT be logged'
+} | Out-Null
+
+# ===========================================================================
+# T20 — settle with no pending state.json: no-op, logs 'settle-no-pending',
+# touches nothing (state.json stays absent, profiles\ is never created).
+# ===========================================================================
+
+Invoke-Scenario -Name 'T20: settle with no pending state -> no-op, settle-no-pending logged' -Body {
+    $sb = New-Sandbox -Label 'T20'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T20:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+
+    Assert-That (-not (Test-Path -LiteralPath $sb.StateFile)) 'sandbox state.json must not exist for this scenario'
+    Assert-That (-not (Test-Path -LiteralPath $sb.ProfilesDir)) 'sandbox profiles\ must not exist yet for this scenario'
+
+    $rc = Invoke-Sync -Sandbox $sb -Mode 'settle'
+    Assert-That ($rc -eq 0) "exit code expected 0, got $rc"
+
+    Assert-That (-not (Test-Path -LiteralPath $sb.StateFile)) 'state.json must still be absent (settle must not create it)'
+    Assert-That (-not (Test-Path -LiteralPath $sb.ProfilesDir)) 'profiles\ must not have been created (settle with no pending session touches nothing)'
+    Assert-That ((Read-TextFile $f) -eq 'T20:ORIGINAL') 'disk content must be unaffected'
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'action=settle-no-pending') "sync.log should record settle-no-pending; log content:`n$log"
+} | Out-Null
+
+# ===========================================================================
+# T21 — CONTRACT A (settle guard v2) "same instance" branch: a pending
+# session, and a matching host process whose StartTime is AT/BEFORE
+# state.json's 'since' -- i.e. an instance that was already running when
+# the session began and so could still be serving it -- is a no-op, logging
+# 'settle-host-running' and touching nothing (pending session stays
+# pending, disk untouched). This scenario gets that "earlier StartTime"
+# property for free: $script:HostAliveProcessName names this very harness's
+# own interpreter process, which -- by construction -- has been running
+# since long before the 'do' below ever wrote state.json, so its StartTime
+# is always <= 'since'. Contrast with T23, which spawns a decoy process
+# specifically so its StartTime is LATER than 'since'.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T21: settle with pending state + SAME host instance still running (StartTime <= since) -> no-op, settle-host-running logged' -Body {
+    $sb = New-Sandbox -Label 'T21'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T21:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    # Establish a pending session the way a crash actually would: a normal
+    # 'do' (backs up _local, seeds/restores the client profile), followed by
+    # in-session edits with no matching 'undo'.
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'PendingClient'
+    Assert-That ($rc1 -eq 0) "do exit code expected 0, got $rc1"
+
+    Write-TextFile -Path $f -Content 'T21:CRASH_STATE'
+
+    # SCP_HOST_PROCESS_NAMES is set to the exact name of the interpreter
+    # running this very harness (see $script:HostAliveProcessName above) --
+    # guaranteed to be an actually-alive process in this test environment,
+    # simulating a streaming-host process still being up.
+    $env:SCP_HOST_PROCESS_NAMES = $script:HostAliveProcessName
+    try {
+        $rc2 = Invoke-Sync -Sandbox $sb -Mode 'settle'
+    }
+    finally {
+        Remove-Item Env:\SCP_HOST_PROCESS_NAMES -ErrorAction SilentlyContinue
+    }
+    Assert-That ($rc2 -eq 0) "settle exit code expected 0, got $rc2"
+
+    Assert-That ((Read-TextFile $f) -eq 'T21:CRASH_STATE') 'disk content must be untouched while the host process is running'
+
+    $pendingDir = Join-Path $sb.ProfilesDir 'PendingClient'
+    Assert-That ((Read-TextFile (Join-Path $pendingDir $entry)) -eq 'T21:ORIGINAL') 'pending client profile must NOT be updated while the host process is running'
+
+    Assert-That (Test-Path -LiteralPath $sb.StateFile) 'state.json must still exist (session must remain pending)'
+    $state = Get-Content -LiteralPath $sb.StateFile -Raw | ConvertFrom-Json
+    Assert-That ($state.activeClient -eq 'PendingClient') "state.activeClient expected to remain 'PendingClient', got '$($state.activeClient)'"
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'action=settle-host-running') "sync.log should record settle-host-running; log content:`n$log"
+} | Out-Null
+
+# ===========================================================================
+# T22 — CONTRACT A (settle guard v2) "no process matches" branch: a pending
+# session and NO process matching any host name pattern at all recovers
+# unconditionally (nothing could possibly be serving the session) -- performs
+# the crash-recovery save (disk -> pending client's profile) AND restores
+# _local back onto disk AND clears state.json.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T22: settle with pending state + no host process -> recovers pending client, restores _local, clears state' -Body {
+    $sb = New-Sandbox -Label 'T22'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T22:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'CrashClient'
+    Assert-That ($rc1 -eq 0) "do exit code expected 0, got $rc1"
+
+    $localDir = Join-Path $sb.ProfilesDir '_local'
+    Assert-That ((Read-TextFile (Join-Path $localDir $entry)) -eq 'T22:ORIGINAL') '_local should hold the original content after the do'
+
+    # Simulate in-session edits, then a crash/disconnect with no 'undo'.
+    Write-TextFile -Path $f -Content 'T22:CRASH_STATE'
+
+    # A name guaranteed not to match any real running process.
+    $env:SCP_HOST_PROCESS_NAMES = 'definitely-not-a-real-process-scp-test-xyz'
+    try {
+        $rc2 = Invoke-Sync -Sandbox $sb -Mode 'settle'
+    }
+    finally {
+        Remove-Item Env:\SCP_HOST_PROCESS_NAMES -ErrorAction SilentlyContinue
+    }
+    Assert-That ($rc2 -eq 0) "settle exit code expected 0, got $rc2"
+
+    $crashDir = Join-Path $sb.ProfilesDir 'CrashClient'
+    Assert-That ((Read-TextFile (Join-Path $crashDir $entry)) -eq 'T22:CRASH_STATE') 'pending client profile should be saved with the disk state at settle time'
+
+    Assert-That ((Read-TextFile $f) -eq 'T22:ORIGINAL') 'disk should be restored back to _local (original) content'
+
+    Assert-That (-not (Test-Path -LiteralPath $sb.StateFile)) 'state.json should be cleared after settle recovers the pending session'
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'mode=settle') "sync.log entries for this run should be tagged mode=settle; log content:`n$log"
+} | Out-Null
+
+# ===========================================================================
+# T23 — CONTRACT A (settle guard v2) "later instance" branch: a pending
+# session, and a matching host process whose StartTime is LATER than
+# state.json's 'since', means every matching instance started AFTER this
+# session began -- none of them can be the one that owns it, so it belongs
+# to a previous host instance (crash/restart of the always-on service) and
+# settle RECOVERS it anyway, exactly as if no process had matched at all.
+# Unlike T21 (which reuses this harness's own already-running interpreter
+# process, guaranteed to have started long before 'since'), this scenario
+# spawns a brand-new decoy process AFTER the pending state is created, and
+# points SCP_HOST_PROCESS_NAMES at a pattern that matches ONLY that decoy
+# (see Start-DecoyHostProcess) -- proving the recovery decision is driven by
+# the StartTime-vs-'since' comparison, not by whether a matching process
+# happens to be alive.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T23: settle with pending state + NEWER host instance (StartTime > since) -> recovers anyway while it is alive' -Body {
+    $sb = New-Sandbox -Label 'T23'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T23:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'PendingClient23'
+    Assert-That ($rc1 -eq 0) "do exit code expected 0, got $rc1"
+
+    # Simulate in-session edits, then a crash/disconnect with no 'undo'.
+    Write-TextFile -Path $f -Content 'T23:CRASH_STATE'
+
+    # Give the clock a beat so the decoy process's StartTime is unambiguously
+    # later than state.json's 'since' (written by the 'do' above), even on
+    # coarse-grained clocks/filesystems.
+    Start-Sleep -Milliseconds 1200
+
+    $decoyName = 'scp23host-{0}' -f ([Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $decoy = Start-DecoyHostProcess -DecoyName $decoyName -Seconds 6
+
+    $env:SCP_HOST_PROCESS_NAMES = $decoyName
+    try {
+        # Sanity check on the test itself, BEFORE settle runs: the decoy
+        # must actually be matchable by the same lookup Get-HostProcessInstanceInfo
+        # uses (Get-Process -Name), not merely alive. A live-but-unmatchable
+        # process (e.g. a process-name-recovery regression, or a renamed-
+        # binary quirk) would make this scenario indistinguishable from
+        # T22's "no process matches at all" case, silently turning this test
+        # into a tautology that proves nothing about the StartTime-vs-'since'
+        # comparison it exists to exercise.
+        Assert-That (@(Get-Process -Name $decoyName -ErrorAction SilentlyContinue).Count -ge 1) 'decoy must be matchable by the SCP_HOST_PROCESS_NAMES pattern (test invariant)'
+
+        $rc2 = Invoke-Sync -Sandbox $sb -Mode 'settle'
+
+        # Sanity check on the test itself: the decoy must still have been
+        # alive (matching the pattern) while settle ran -- otherwise this
+        # scenario would be indistinguishable from T22's "no process
+        # matches at all" case and would prove nothing about the
+        # StartTime-vs-'since' comparison specifically.
+        $decoy.Process.Refresh()
+        Assert-That (-not $decoy.Process.HasExited) 'decoy host process should still be alive while settle ran (test invariant)'
+    }
+    finally {
+        Remove-Item Env:\SCP_HOST_PROCESS_NAMES -ErrorAction SilentlyContinue
+        Stop-DecoyHostProcess -Decoy $decoy
+    }
+    Assert-That ($rc2 -eq 0) "settle exit code expected 0, got $rc2"
+
+    $crashDir = Join-Path $sb.ProfilesDir 'PendingClient23'
+    Assert-That ((Read-TextFile (Join-Path $crashDir $entry)) -eq 'T23:CRASH_STATE') 'pending client profile should be saved with the disk state at settle time'
+
+    Assert-That ((Read-TextFile $f) -eq 'T23:ORIGINAL') 'disk should be restored back to _local (original) content'
+
+    Assert-That (-not (Test-Path -LiteralPath $sb.StateFile)) 'state.json should be cleared -- a newer host instance cannot be serving an older pending session'
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'mode=settle') "sync.log entries for this run should be tagged mode=settle; log content:`n$log"
+    Assert-That ($null -eq $log -or $log -notmatch 'action=settle-host-running') 'settle-host-running must NOT be logged -- the only matching process started after the session began'
+} | Out-Null
+
+# ===========================================================================
+# T24 — CONTRACT A (settle guard v2) "unknown" branch: a pending session
+# with a matching (alive) host process but an unparseable/missing 'since'
+# means the StartTime-vs-'since' comparison cannot be made at all -- this is
+# the conservative no-op safety valve, distinct from both settle-host-running
+# (branch 3, comparison made and instance could still own the session) and
+# recovery (branches 2/3-else, comparison made and it definitely can't). It
+# must touch nothing: disk, profiles\, and state.json all stay exactly as
+# the crash left them, logging the distinct 'settle-host-unknown' action.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T24: settle with pending state + matching host process but unparseable since -> no-op, settle-host-unknown logged' -Body {
+    $sb = New-Sandbox -Label 'T24'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T24:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'PendingClient24'
+    Assert-That ($rc1 -eq 0) "do exit code expected 0, got $rc1"
+
+    # Simulate in-session edits, then a crash/disconnect with no 'undo'.
+    Write-TextFile -Path $f -Content 'T24:CRASH_STATE'
+
+    # Hand-corrupt just the 'since' field -- activeClient stays the real
+    # pending client so this scenario is otherwise identical to T21/T23,
+    # isolating the unparseable-'since' branch specifically.
+    Write-TextFile -Path $sb.StateFile -Content '{"activeClient":"PendingClient24","since":"not-a-timestamp","localBackedUp":true}'
+
+    # A matching, guaranteed-alive process (this harness's own interpreter,
+    # as T21 uses) -- Found must be true so the scenario actually exercises
+    # "matching process, but can't read 'since'" rather than degenerating
+    # into T22's "no process matches" branch.
+    $env:SCP_HOST_PROCESS_NAMES = $script:HostAliveProcessName
+    try {
+        $rc2 = Invoke-Sync -Sandbox $sb -Mode 'settle'
+    }
+    finally {
+        Remove-Item Env:\SCP_HOST_PROCESS_NAMES -ErrorAction SilentlyContinue
+    }
+    Assert-That ($rc2 -eq 0) "settle exit code expected 0, got $rc2"
+
+    Assert-That ((Read-TextFile $f) -eq 'T24:CRASH_STATE') 'disk content must be untouched -- an unparseable since must not trigger recovery'
+
+    $pendingDir = Join-Path $sb.ProfilesDir 'PendingClient24'
+    Assert-That ((Read-TextFile (Join-Path $pendingDir $entry)) -eq 'T24:ORIGINAL') 'pending client profile must NOT be updated -- settle-host-unknown must be a pure no-op'
+
+    Assert-That (Test-Path -LiteralPath $sb.StateFile) 'state.json must still exist (session must remain pending)'
+    $state = Get-Content -LiteralPath $sb.StateFile -Raw | ConvertFrom-Json
+    Assert-That ($state.activeClient -eq 'PendingClient24') "state.activeClient expected to remain 'PendingClient24', got '$($state.activeClient)'"
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'action=settle-host-unknown') "sync.log should record settle-host-unknown; log content:`n$log"
+    Assert-That ($null -eq $log -or $log -notmatch 'action=settle-host-running') 'settle-host-running must NOT be logged -- since could not be parsed at all'
 } | Out-Null
 
 # ===========================================================================
