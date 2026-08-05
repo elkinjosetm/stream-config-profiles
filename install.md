@@ -27,11 +27,9 @@ Open the `paths.txt` file (located inside the `stream-config-profiles` folder) i
 Add the full paths to your game configuration files or folders — one path per line. Examples:
 
 ```
-# Forza Horizon 6
-%LOCALAPPDATA%\ForzaHorizon6\LocalStorage_Shared\ForzaUserConfigSelections
-
-# Another game
-C:\Users\YourUsername\Documents\MyGame\settings.ini
+# Replace these examples with your actual game config paths (see README for details):
+# %LOCALAPPDATA%\YourGame1\Settings\graphics.ini
+# %APPDATA%\YourGame2\Config\GraphicsSettings
 ```
 
 **Format rules:**
@@ -40,6 +38,8 @@ C:\Users\YourUsername\Documents\MyGame\settings.ini
 - Lines starting with `#` are comments
 - Blank lines are ignored
 - Paths can use environment variables like `%LOCALAPPDATA%`, `%USERPROFILE%`, etc.
+
+**Finding your game's config path:** Every game stores its configuration in a different location. A good resource is [PCGamingWiki](https://www.pcgamingwiki.com) — each game's page has a "Configuration file(s) location" section listing the exact path.
 
 See `README.md` for more details on the format.
 
@@ -104,12 +104,12 @@ After entering both commands, check that:
 Test the installation before relying on it for gameplay:
 
 1. **Open your game** and verify you can see your current graphics settings (resolution, quality, etc.) — take note of what you see
-2. **Start a stream** from any client (iPad, phone, another PC, etc.)
+2. **Start a stream** from any client (tablet, phone, another PC, etc.)
 3. **Check that the tool created the folders:**
    - Navigate to `C:\stream-config-profiles\profiles\`
    - You should now see:
      - A `_local` folder (your PC's original config backup)
-     - A folder named after your streaming client (e.g., `iPad`, `AppleTV`, `Phone`)
+     - A folder named after your streaming client (e.g., `LivingRoomTV`, or whatever name your client reports)
 4. **Check for the log file:**
    - In `C:\stream-config-profiles\`, you should see a `sync.log` file (created by the tool)
    - Open it to verify there are no error messages

@@ -2,11 +2,11 @@
 
 ## What It Is
 
-**stream-config-profiles** automatically manages game graphics settings for different streaming clients. Games store their display configuration (resolution, quality) in config files on your PC but have no awareness of different client devices. This tool solves that: when you stream to an iPad at 1080p, then switch to a 4K monitor, each client automatically gets its own saved graphics profile, with no manual tweaking in-game.
+**stream-config-profiles** automatically manages game graphics settings for different streaming clients. Games store their display configuration (resolution, quality) in config files on your PC but have no awareness of different client devices. This tool solves that: when you stream to different devices with different resolutions, each client automatically gets its own saved graphics profile, with no manual tweaking in-game.
 
 ## The Problem It Solves
 
-Streaming the same PC to multiple clients (iPad @ 1080p/120, Apple TV @ 1440p/60, 4K monitor) usually requires manually adjusting in-game graphics settings every time you switch clients. Games persist their own config files and ignore the streaming client's display. This tool maintains a separate graphics profile for each client, automatically restoring it at session start.
+Streaming the same PC to multiple clients (e.g., a tablet at 1080p vs. a 4K TV) usually requires manually adjusting in-game graphics settings every time you switch clients. Games persist their own config files and ignore the streaming client's display. This tool maintains a separate graphics profile for each client, automatically restoring it at session start.
 
 ## How It Works
 
@@ -14,7 +14,7 @@ Streaming the same PC to multiple clients (iPad @ 1080p/120, Apple TV @ 1440p/60
 
 The tool maintains a folder structure under `profiles/`:
 - **`profiles/_local/`** — Your PC's own graphics settings, created automatically and refreshed every time you start a clean streaming session (it's overwritten with whatever your local config was immediately before that session began — not a one-time snapshot taken at install time)
-- **`profiles/<ClientName>/`** — One profile per streaming client (iPad, AppleTV, Monitor, etc.)
+- **`profiles/<ClientName>/`** — One profile per streaming client (the folder name comes from whatever name your client reports via `APOLLO_CLIENT_NAME` or `SUNSHINE_CLIENT_NAME`)
 
 Each profile contains copies of the config files/folders you list in `paths.txt`.
 
@@ -42,8 +42,8 @@ stream-config-profiles\
 ├── sync.log               # Append-only debug log
 └── profiles\              # Created automatically
     ├── _local\            # Your PC's config (implicit profile)
-    ├── iPad\              # Example: profile for iPad client
-    └── AppleTV\           # Example: profile for AppleTV client
+    ├── LivingRoomTV\      # Example: profile for a specific client
+    └── <ClientName>\      # Replace with your actual client name(s)
 ```
 
 ### Editing paths.txt
@@ -54,12 +54,12 @@ List the full paths to game config files or folders you want managed:
 # One path per line. No quotes, even with spaces.
 # Blank lines and lines starting with # are ignored.
 
-# Forza Horizon 6 (graphics config only, not saves)
-%LOCALAPPDATA%\ForzaHorizon6\LocalStorage_Shared\ForzaUserConfigSelections
-
-# Your Game (another example)
-%APPDATA%\YourGame\Config\GraphicsSettings
+# Replace these examples with your actual game config paths (see below for how to find them):
+# %LOCALAPPDATA%\YourGame1\Settings\graphics.ini
+# %APPDATA%\YourGame2\Config\GraphicsSettings
 ```
+
+**Finding your game's config path:** Every game stores its configuration in a different location. A good resource is [PCGamingWiki](https://www.pcgamingwiki.com) — each game's page has a "Configuration file(s) location" section listing the exact path.
 
 **Format rules:**
 - One path per line
@@ -91,7 +91,7 @@ Graphics settings are loaded when the game starts. If you swap profiles while a 
 Some games have special behavior worth knowing:
 
 - **Steam Cloud**: Steam may auto-sync your game's cloud saves, which can interfere with testing. If config changes seem to "reset" unexpectedly, disable Steam Cloud for that game in your Steam client.
-- **Forza Horizon 6**: FH6 has `UseDynamicOptimization` / `isDynamic` attributes in its config that can override your manual graphics settings. Manual resolution changes work, but be aware the game may adjust quality dynamically.
+- **Dynamic Optimization**: Some games have dynamic-optimization settings that can override manually chosen values. If restored settings don't seem to stick, check your game's configuration for such options.
 
 ## Troubleshooting
 
