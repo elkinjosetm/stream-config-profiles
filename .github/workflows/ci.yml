@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # windows-latest + shell: powershell is REAL Windows PowerShell
+          # 5.1 -- one of the two blind spots the Linux-only harness can't
+          # cover (the other being real robocopy, exercised on this same
+          # leg since run-tests.ps1 only uses its bash/cmd shim off-Windows).
+          - os: windows-latest
+            shell: powershell
+            name: 'Windows PowerShell 5.1'
+          - os: windows-latest
+            shell: pwsh
+            name: 'PowerShell 7 (Windows)'
+          - os: ubuntu-latest
+            shell: pwsh
+            name: 'PowerShell 7 (Linux)'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run test suite
+        shell: ${{ matrix.shell }}
+        # No TEST_HOST_EXE override needed: run-tests.ps1 picks the child
+        # host that matches the PSEdition it is itself running under
+        # (Desktop -> powershell.exe, Core -> the pwsh under $PSHOME), so
+        # each matrix leg naturally drives sync-configs.ps1 with the same
+        # host GitHub Actions launched for this step.
+        #
+        # Exit-code propagation: run-tests.ps1 exits 0 on success and 1 on
+        # failure. GitHub Actions runs this step by dot-sourcing the script
+        # inside the shell named by `shell:` and then appending its own
+        # trailing check -- roughly
+        #   if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }
+        # -- to the generated step script; that appended line is what turns
+        # run-tests.ps1's exit code into the step's actual process exit code.
+        # (A dot-sourced script's own top-level `exit` does not, by itself,
+        # reliably terminate the host process when more statements follow it
+        # in the same script -- only the runner's appended check makes that
+        # happen here.) The upshot is still simple: 0 passes, non-zero fails
+        # this step with no extra plumbing on our side.
+        run: ./tests/run-tests.ps1
+
+  lint:
+    name: Lint (PSScriptAnalyzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          # Pinned deliberately: an unpinned Install-Module always takes the
+          # newest PSGallery release, so a future PSScriptAnalyzer version
+          # that adds a rule or promotes one to Error severity would turn
+          # this job red with no repo change. Bump this version deliberately.
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser -Repository PSGallery -SkipPublisherCheck
+          Import-Module PSScriptAnalyzer
+          "Using PSScriptAnalyzer $((Get-Module PSScriptAnalyzer).Version)"
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          # Invoke-ScriptAnalyzer's -Path parameter is a single string, not
+          # string[] (see Engine/Commands/InvokeScriptAnalyzerCommand.cs) --
+          # passing an array of paths gets silently space-joined by
+          # PowerShell's parameter binder into one nonexistent path. Invoke
+          # once per target file and aggregate instead.
+          $targets = @('sync-configs.ps1', 'tests/run-tests.ps1')
+          foreach ($t in $targets) {
+              if (-not (Test-Path -LiteralPath $t)) {
+                  throw "lint target not found: $t"
+              }
+          }
+
+          $results = @(foreach ($t in $targets) {
+              Invoke-ScriptAnalyzer -Path $t -Settings ./PSScriptAnalyzerSettings.psd1
+          })
+
+          if ($results.Count -eq 0) {
+              Write-Host 'PSScriptAnalyzer: no diagnostics found.' -ForegroundColor Green
+              exit 0
+          }
+
+          Write-Host "PSScriptAnalyzer: $($results.Count) diagnostic(s) found:" -ForegroundColor Cyan
+          $results | Format-Table -AutoSize -Property Severity, RuleName, ScriptName, Line, Message | Out-String -Width 4096 | Write-Host
+
+          # Fatal: any Error- or ParseError-severity diagnostic, or any
+          # PSUseCompatibleSyntax hit (5.1/7.0 compatibility is a hard
+          # requirement for this zero-dependency, dual-PSEdition codebase).
+          # ParseError is a distinct, more severe member of
+          # DiagnosticSeverity (Information/Warning/Error/ParseError) emitted
+          # only by the engine when a file fails to parse at all -- that is
+          # exactly the class of breakage this lint gate must not wave
+          # through, so it is treated as fatal alongside Error. Everything
+          # else is a warning, printed above but non-fatal.
+          $fatal = @($results | Where-Object { $_.Severity -eq 'Error' -or $_.Severity -eq 'ParseError' -or $_.RuleName -eq 'PSUseCompatibleSyntax' })
+
+          if ($fatal.Count -gt 0) {
+              Write-Host "$($fatal.Count) fatal diagnostic(s) (Severity=Error/ParseError or PSUseCompatibleSyntax):" -ForegroundColor Red
+              $fatal | Format-List | Out-String -Width 4096 | Write-Host
+              exit 1
+          }
+
+          Write-Host 'No fatal diagnostics (Severity=Error/ParseError or PSUseCompatibleSyntax); warnings above are non-fatal.' -ForegroundColor Yellow
+          exit 0

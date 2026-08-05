@@ -5,26 +5,49 @@
 
 .DESCRIPTION
     Builds an isolated sandbox per run under the system temp directory,
-    drives the real script via a child pwsh process exactly the way
+    drives the real script via a child PowerShell process exactly the way
     Vibepollo would (env var + -Mode do|undo), and asserts on-disk /
     profile / state.json outcomes for every scenario in the task brief
-    (T1..T9). Prints a PASS/FAIL table and exits non-zero if anything
+    (T1..T17). Prints a PASS/FAIL table and exits non-zero if anything
     failed.
 
-    Because robocopy does not exist on Linux, this harness builds a tiny
-    PATH shim (a script literally named 'robocopy') that mimics the exact
-    subset of robocopy behavior sync-configs.ps1 depends on: copy contents
-    of SRC into DST, overwrite existing files, never delete extras already
-    in DST, create DST if missing, ignore the /R:1 /W:1 /NFL /NDL /NJH /NJS
-    flags, and exit with a robocopy-style "success" code (< 8).
+    The child host mirrors whichever host is running this harness: PSEdition
+    'Desktop' (Windows PowerShell 5.1) launches children with powershell.exe;
+    PSEdition 'Core' launches children with the pwsh binary under this
+    process's own $PSHOME. See the TEST_HOST_EXE parameter below to override.
+
+    On real Windows, robocopy is real robocopy.exe already on PATH -- one of
+    the two blind spots pure-Linux testing can't cover. On non-Windows
+    platforms (where robocopy doesn't exist) this harness instead builds a
+    tiny PATH shim (a script literally named 'robocopy') that mimics the
+    exact subset of robocopy behavior sync-configs.ps1 depends on: copy
+    contents of SRC into DST, overwrite existing files, never delete extras
+    already in DST, create DST if missing, ignore the /R:1 /W:1 /NFL /NDL
+    /NJH /NJS flags, and exit with a robocopy-style "success" code (< 8).
+    -ForceShim forces this same shim on Windows too. T16 (forced robocopy
+    failure via SHIM_ROBOCOPY_RC) only means anything with the shim in play,
+    so it SKIPs (not fails) whenever real robocopy is in use.
 
 .PARAMETER KeepSandbox
     Do not delete the temp sandbox tree afterwards (useful for debugging a
     failure). Normally the sandbox is removed when the harness exits.
+
+.PARAMETER ForceShim
+    Force use of the bash/cmd robocopy shim even on Windows, where the real
+    robocopy.exe on PATH is normally preferred. Non-Windows platforms always
+    use the shim regardless of this switch (robocopy doesn't exist there).
+
+.NOTES
+    Environment override: TEST_HOST_EXE, if set to an absolute path, forces
+    the interpreter used to launch sync-configs.ps1 as a child process,
+    taking priority over the Desktop/Core auto-detection described above.
+    Intended for CI matrices or manual testing that need to pin a specific
+    interpreter.
 #>
 
 param(
-    [switch]$KeepSandbox
+    [switch]$KeepSandbox,
+    [switch]$ForceShim
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,16 +66,35 @@ if (-not (Test-Path -LiteralPath $script:SyncScriptSource)) {
     exit 1
 }
 
-if (Test-Path -LiteralPath '/opt/pwsh/pwsh') {
-    $script:PwshExe = '/opt/pwsh/pwsh'
+function Test-IsWindowsPlatform {
+    # $IsWindows/$IsLinux/$IsMacOS only exist on PowerShell 6+. Windows
+    # PowerShell 5.1 (PSEdition 'Desktop') is always Windows. Use
+    # Get-Variable (not a direct $IsWindows reference) so this is safe
+    # under Set-StrictMode on both editions.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { return $true }
+    return [bool](Get-Variable -Name 'IsWindows' -ErrorAction SilentlyContinue -ValueOnly)
 }
-elseif (Get-Command pwsh -ErrorAction SilentlyContinue) {
-    $script:PwshExe = (Get-Command pwsh).Source
+
+# Child-host selection: always launch sync-configs.ps1 with the SAME
+# PowerShell host that is running this harness -- PSEdition 'Desktop' means
+# we ourselves are Windows PowerShell 5.1, so the child must be
+# powershell.exe; PSEdition 'Core' means the child is the pwsh binary living
+# under our own $PSHOME (so a harness run under, e.g., /opt/pwsh/pwsh
+# naturally launches children with /opt/pwsh/pwsh too, and a Windows pwsh
+# leg launches children with that same Windows pwsh.exe). $env:TEST_HOST_EXE
+# is an absolute-path override checked first, for CI matrices or manual
+# testing that need to force a specific interpreter.
+if ($env:TEST_HOST_EXE) {
+    $script:PwshExe = $env:TEST_HOST_EXE
 }
-else {
-    # Windows fallback: PowerShell 5.1's own host.
+elseif ($PSVersionTable.PSEdition -eq 'Desktop') {
     $script:PwshExe = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
     if (-not $script:PwshExe) { $script:PwshExe = 'powershell.exe' }
+}
+else {
+    $pwshLeaf = 'pwsh'
+    if (Test-IsWindowsPlatform) { $pwshLeaf = 'pwsh.exe' }
+    $script:PwshExe = Join-Path $PSHOME $pwshLeaf
 }
 
 # ---------------------------------------------------------------------------
@@ -65,14 +107,11 @@ New-Item -ItemType Directory -Path $script:TempRoot -Force | Out-Null
 $script:ShimDir = Join-Path $script:TempRoot 'shim'
 New-Item -ItemType Directory -Path $script:ShimDir -Force | Out-Null
 
-function Test-IsWindowsPlatform {
-    # $IsWindows/$IsLinux/$IsMacOS only exist on PowerShell 6+. Windows
-    # PowerShell 5.1 (PSEdition 'Desktop') is always Windows. Use
-    # Get-Variable (not a direct $IsWindows reference) so this is safe
-    # under Set-StrictMode on both editions.
-    if ($PSVersionTable.PSEdition -eq 'Desktop') { return $true }
-    return [bool](Get-Variable -Name 'IsWindows' -ErrorAction SilentlyContinue -ValueOnly)
-}
+# On real Windows, prefer the real robocopy.exe already on PATH so CI
+# exercises actual robocopy behavior (one of the two blind spots pure-Linux
+# testing has). Only fall back to the shim on non-Windows platforms
+# (robocopy doesn't exist there) or when -ForceShim is passed explicitly.
+$script:UseShim = (-not (Test-IsWindowsPlatform)) -or $ForceShim
 
 function New-RobocopyShim {
     # Bash shim used when this harness itself runs on Linux/macOS.
@@ -140,15 +179,21 @@ fi
 exit 1
 '@ -replace "`r`n", "`n"
 
-    Set-Content -LiteralPath $shPath -Value $shContent -NoNewline -Encoding UTF8
+    # Only write the bash shim on non-Windows, and only the .cmd shim on
+    # Windows (-ForceShim). Dropping both into the same shim directory
+    # unconditionally would leave an extensionless 'robocopy' bash file
+    # sitting alongside 'robocopy.cmd' on Windows -- a bare 'robocopy'
+    # command-resolution order there could in principle be influenced by
+    # PATH ordering, so avoid the ambiguity entirely by only ever writing
+    # the one shim file relevant to the platform actually running us.
     if (-not (Test-IsWindowsPlatform)) {
+        Set-Content -LiteralPath $shPath -Value $shContent -NoNewline -Encoding UTF8
         & chmod +x $shPath 2>$null | Out-Null
+        return
     }
 
-    # Windows-usable equivalent, dropped alongside for portability so this
-    # same harness (and shim directory) works unchanged if ever run on a
-    # real Windows box, where a bare 'robocopy' resolution order could in
-    # principle be influenced by PATH ordering.
+    # Windows-usable equivalent (used only with -ForceShim, since real
+    # robocopy.exe is normally preferred on Windows).
     $cmdPath = Join-Path $script:ShimDir 'robocopy.cmd'
     $cmdContent = @'
 @echo off
@@ -170,14 +215,24 @@ if defined SHIM_ROBOCOPY_RC (
     exit /b %SHIM_ROBOCOPY_RC%
 )
 exit /b 1
-'@ -replace "`n", "`r`n"
+'@ -replace "`r`n", "`n" -replace "`n", "`r`n"
+    # Normalize to bare LF first, then re-expand to CRLF: the raw here-string
+    # above already contains CRLF when this file itself is checked out with
+    # CRLF line endings (e.g. Git for Windows' default core.autocrlf=true on
+    # windows-latest runners, since this repo has no .gitattributes forcing
+    # LF). A plain "-replace `n, `r`n" is NOT idempotent against that case --
+    # it turns each existing \r\n into \r\r\n, corrupting the batch file.
     Set-Content -LiteralPath $cmdPath -Value $cmdContent -Encoding ASCII
 }
 
 New-RobocopyShim
 
-# Prepend the shim dir to PATH for every child process this harness spawns.
-$env:PATH = $script:ShimDir + [System.IO.Path]::PathSeparator + $env:PATH
+if ($script:UseShim) {
+    # Prepend the shim dir to PATH for every child process this harness
+    # spawns. Left off PATH entirely on Windows without -ForceShim so
+    # sync-configs.ps1 finds the real robocopy.exe already on PATH there.
+    $env:PATH = $script:ShimDir + [System.IO.Path]::PathSeparator + $env:PATH
+}
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -285,7 +340,12 @@ function Invoke-Sync {
     else { Remove-Item Env:\SUNSHINE_CLIENT_NAME -ErrorAction SilentlyContinue }
 
     $global:LASTEXITCODE = $null
-    & $script:PwshExe -NoProfile -File $Sandbox.ScriptPath -Mode $Mode | Out-Null
+    # -ExecutionPolicy Bypass matches the documented Vibepollo invocation
+    # (SPEC.md / install.md: `powershell.exe -ExecutionPolicy Bypass -File
+    # ...`) exactly, so the harness exercises the real shipped command line
+    # rather than one that happens to work only because CI's default policy
+    # is permissive. pwsh accepts (and ignores) the switch on every platform.
+    & $script:PwshExe -NoProfile -ExecutionPolicy Bypass -File $Sandbox.ScriptPath -Mode $Mode | Out-Null
     return $LASTEXITCODE
 }
 
@@ -333,9 +393,25 @@ function Invoke-Scenario {
     $script:ScenarioResults.Add([PSCustomObject]@{
         Name     = $Name
         Pass     = $pass
+        Skip     = $false
+        Reason   = $null
         Failures = @($script:Failures)
     })
     return $pass
+}
+
+function Add-SkippedScenario {
+    # Records a scenario as SKIP instead of running it. Counted separately
+    # from passed/failed in the summary table and total line; never
+    # contributes to the failure count, so it never affects the exit code.
+    param([string]$Name, [string]$Reason)
+    $script:ScenarioResults.Add([PSCustomObject]@{
+        Name     = $Name
+        Pass     = $true
+        Skip     = $true
+        Reason   = $Reason
+        Failures = @()
+    })
 }
 
 # ===========================================================================
@@ -545,7 +621,11 @@ Invoke-Scenario -Name 'T7: nonexistent path in paths.txt -> logged, skipped, oth
 
 Invoke-Scenario -Name 'T8: folder restore preserves extra files (no /MIR)' -Body {
     $sb = New-Sandbox -Label 'T8'
-    $folderDir = Join-Path $sb.Root 'game-configs/cfgfolder'
+    # Space in the path deliberately: exercises real robocopy.exe on Windows
+    # through PowerShell's native-argv quoting for a folder path containing
+    # a space, one of the two hazards SPEC.md's trailing-separator
+    # normalization exists for (see also T17).
+    $folderDir = Join-Path $sb.Root 'game configs/cfg folder'
     Write-TextFile -Path (Join-Path $folderDir 'file1.txt') -Content 'F1:ORIGINAL'
     Set-PathsFile -Sandbox $sb -Lines @($folderDir)
 
@@ -760,7 +840,7 @@ Invoke-Scenario -Name 'T14: invalid -Mode value still exits 0' -Body {
     Remove-Item Env:\SUNSHINE_CLIENT_NAME -ErrorAction SilentlyContinue
 
     $global:LASTEXITCODE = $null
-    & $script:PwshExe -NoProfile -File $sb.ScriptPath -Mode 'bogus' | Out-Null
+    & $script:PwshExe -NoProfile -ExecutionPolicy Bypass -File $sb.ScriptPath -Mode 'bogus' | Out-Null
     $rc = $LASTEXITCODE
     Assert-That ($rc -eq 0) "exit code for an invalid -Mode expected 0, got $rc"
 } | Out-Null
@@ -790,24 +870,34 @@ Invoke-Scenario -Name 'T15: SUNSHINE_CLIENT_NAME fallback works when APOLLO_CLIE
 # process must still exit 0.
 # ===========================================================================
 
-Invoke-Scenario -Name 'T16: forced robocopy failure (rc>=8) is logged as an error, process still exits 0' -Body {
-    $sb = New-Sandbox -Label 'T16'
-    $folderDir = Join-Path $sb.Root 'game-configs/failfolder'
-    Write-TextFile -Path (Join-Path $folderDir 'file1.txt') -Content 'F1:ORIGINAL'
-    Set-PathsFile -Sandbox $sb -Lines @($folderDir)
+if ($script:UseShim) {
+    Invoke-Scenario -Name 'T16: forced robocopy failure (rc>=8) is logged as an error, process still exits 0' -Body {
+        $sb = New-Sandbox -Label 'T16'
+        $folderDir = Join-Path $sb.Root 'game-configs/failfolder'
+        Write-TextFile -Path (Join-Path $folderDir 'file1.txt') -Content 'F1:ORIGINAL'
+        Set-PathsFile -Sandbox $sb -Lines @($folderDir)
 
-    $env:SHIM_ROBOCOPY_RC = '16'
-    try {
-        $rc = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'FailClient'
-    }
-    finally {
-        Remove-Item Env:\SHIM_ROBOCOPY_RC -ErrorAction SilentlyContinue
-    }
-    Assert-That ($rc -eq 0) "exit code expected 0 even when robocopy fails, got $rc"
+        $env:SHIM_ROBOCOPY_RC = '16'
+        try {
+            $rc = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'FailClient'
+        }
+        finally {
+            Remove-Item Env:\SHIM_ROBOCOPY_RC -ErrorAction SilentlyContinue
+        }
+        Assert-That ($rc -eq 0) "exit code expected 0 even when robocopy fails, got $rc"
 
-    $log = Read-TextFile $sb.LogFile
-    Assert-That ($null -ne $log -and $log -match 'action=[a-z-]*error-robocopy-16') 'sync.log should record the forced robocopy failure with its exit code'
-} | Out-Null
+        $log = Read-TextFile $sb.LogFile
+        Assert-That ($null -ne $log -and $log -match 'action=[a-z-]*error-robocopy-16') 'sync.log should record the forced robocopy failure with its exit code'
+    } | Out-Null
+}
+else {
+    # Real robocopy is in play here (Windows, no -ForceShim). There is no
+    # supported way to force real robocopy.exe to return an arbitrary
+    # failure code on demand, so this scenario only means anything when the
+    # shim (which honors SHIM_ROBOCOPY_RC) is in the loop. Skip rather than
+    # fake it or silently drop coverage of the rc>=8 handling path.
+    Add-SkippedScenario -Name 'T16: forced robocopy failure (rc>=8) is logged as an error, process still exits 0' -Reason 'requires robocopy shim'
+}
 
 # ===========================================================================
 # T17 — a folder path listed with a trailing separator normalizes to the
@@ -816,7 +906,11 @@ Invoke-Scenario -Name 'T16: forced robocopy failure (rc>=8) is logged as an erro
 
 Invoke-Scenario -Name 'T17: trailing separator on a folder path normalizes to a single profile entry' -Body {
     $sb = New-Sandbox -Label 'T17'
-    $folderDir = Join-Path $sb.Root 'game-configs/trailingsepfolder'
+    # Space in the path AND a trailing separator: the exact combined hazard
+    # SPEC.md's trailing-separator normalization exists for -- a folder path
+    # with a space, before normalization ending in a trailing backslash,
+    # passed through PowerShell 5.1 native-argv quoting to robocopy.exe.
+    $folderDir = Join-Path $sb.Root 'game configs/trailing sep folder'
     Write-TextFile -Path (Join-Path $folderDir 'file1.txt') -Content 'F1:ORIGINAL'
     Set-PathsFile -Sandbox $sb -Lines @(($folderDir + '/'))
 
@@ -845,23 +939,38 @@ Write-Host '================' -ForegroundColor Cyan
 
 $maxNameLen = ($script:ScenarioResults | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
 foreach ($r in $script:ScenarioResults) {
-    $status = if ($r.Pass) { 'PASS' } else { 'FAIL' }
-    $color = if ($r.Pass) { 'Green' } else { 'Red' }
+    if ($r.Skip) {
+        $status = 'SKIP'
+        $color = 'Yellow'
+    }
+    elseif ($r.Pass) {
+        $status = 'PASS'
+        $color = 'Green'
+    }
+    else {
+        $status = 'FAIL'
+        $color = 'Red'
+    }
     $paddedName = $r.Name.PadRight($maxNameLen)
     Write-Host ("[{0}] {1}" -f $status, $paddedName) -ForegroundColor $color
-    if (-not $r.Pass) {
+    if ($r.Skip) {
+        Write-Host ("       - reason: {0}" -f $r.Reason) -ForegroundColor Yellow
+    }
+    elseif (-not $r.Pass) {
         foreach ($f in $r.Failures) {
             Write-Host ("       - {0}" -f $f) -ForegroundColor Yellow
         }
     }
 }
 
+$skippedCount = @($script:ScenarioResults | Where-Object { $_.Skip }).Count
 $failedCount = @($script:ScenarioResults | Where-Object { -not $_.Pass }).Count
 $totalCount = $script:ScenarioResults.Count
+$passedCount = $totalCount - $failedCount - $skippedCount
 
 Write-Host ''
 $summaryColor = if ($failedCount -eq 0) { 'Green' } else { 'Red' }
-Write-Host ("TOTAL: {0} passed, {1} failed (of {2})" -f ($totalCount - $failedCount), $failedCount, $totalCount) -ForegroundColor $summaryColor
+Write-Host ("TOTAL: {0} passed, {1} skipped, {2} failed (of {3})" -f $passedCount, $skippedCount, $failedCount, $totalCount) -ForegroundColor $summaryColor
 
 if (-not $KeepSandbox) {
     Remove-Item -LiteralPath $script:TempRoot -Recurse -Force -ErrorAction SilentlyContinue
