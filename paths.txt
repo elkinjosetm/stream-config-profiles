@@ -5,7 +5,6 @@
 # This file ships with no active paths -- add your own game config
 # paths below, one per line, no quotes even if the path has spaces.
 #
-# Example (commented out on purpose -- uncomment and edit if this
-# applies to your PC, or delete these lines and add your own instead):
-# Forza Horizon 6 (graphics config only, not saves)
-# %LOCALAPPDATA%\ForzaHorizon6\LocalStorage_Shared\ForzaUserConfigSelections
+# This example is intentionally commented out — a fresh install syncs nothing.
+# Replace it below with your game's actual config path (see README for details):
+# %LOCALAPPDATA%\YourGame\Settings\graphics.ini
