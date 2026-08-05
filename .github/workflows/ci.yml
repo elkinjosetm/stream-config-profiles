@@ -30,26 +30,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run test suite
-        shell: ${{ matrix.shell }}
-        # No TEST_HOST_EXE override needed: run-tests.ps1 picks the child
-        # host that matches the PSEdition it is itself running under
-        # (Desktop -> powershell.exe, Core -> the pwsh under $PSHOME), so
-        # each matrix leg naturally drives sync-configs.ps1 with the same
-        # host GitHub Actions launched for this step.
-        #
-        # Exit-code propagation: run-tests.ps1 exits 0 on success and 1 on
-        # failure. GitHub Actions runs this step by dot-sourcing the script
-        # inside the shell named by `shell:` and then appending its own
-        # trailing check -- roughly
-        #   if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }
-        # -- to the generated step script; that appended line is what turns
-        # run-tests.ps1's exit code into the step's actual process exit code.
-        # (A dot-sourced script's own top-level `exit` does not, by itself,
-        # reliably terminate the host process when more statements follow it
-        # in the same script -- only the runner's appended check makes that
-        # happen here.) The upshot is still simple: 0 passes, non-zero fails
-        # this step with no extra plumbing on our side.
+      # No TEST_HOST_EXE override needed: run-tests.ps1 picks the child
+      # host that matches the PSEdition it is itself running under
+      # (Desktop -> powershell.exe, Core -> the pwsh under $PSHOME), so
+      # each matrix leg naturally drives sync-configs.ps1 with the same
+      # host GitHub Actions launched for this step.
+      #
+      # Exit-code propagation: run-tests.ps1 exits 0 on success and 1 on
+      # failure. GitHub Actions runs this step by dot-sourcing the script
+      # inside the shell named by `shell:` and then appending its own
+      # trailing check -- roughly
+      #   if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }
+      # -- to the generated step script; that appended line is what turns
+      # run-tests.ps1's exit code into the step's actual process exit code.
+      # (A dot-sourced script's own top-level `exit` does not, by itself,
+      # reliably terminate the host process when more statements follow it
+      # in the same script -- only the runner's appended check makes that
+      # happen here.) The upshot is still simple: 0 passes, non-zero fails
+      # this step with no extra plumbing on our side.
+      #
+      # Split into two steps because `shell:` does not accept expressions
+      # (e.g. `${{ matrix.shell }}`) -- it must be a hardcoded value -- so
+      # each candidate shell gets its own step gated by an `if:` on the
+      # matrix value instead.
+      - name: Run test suite (Windows PowerShell 5.1)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./tests/run-tests.ps1
+
+      - name: Run test suite (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
         run: ./tests/run-tests.ps1
 
   lint:
