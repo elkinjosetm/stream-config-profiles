@@ -3,8 +3,8 @@
 ## Prerequisites
 
 - Windows PC running **Vibepollo 1.17.0 or later** (Apollo fork for game streaming)
-- Administrator access to run PowerShell commands
 - Basic familiarity with copy/paste and text editing
+- The script itself never needs to run as Administrator — Vibepollo runs it unattended at every stream start/end, and an elevation (UAC) prompt would silently block that. You only need elevated access at all if you choose to place the `stream-config-profiles` folder somewhere that requires it (e.g. directly under `C:\` or inside `Program Files`); picking a location under your own user profile avoids this entirely.
 
 ## Installation Steps
 
@@ -115,10 +115,11 @@ Test the installation before relying on it for gameplay:
    - Open it to verify there are no error messages
 
 5. **Play the game** during the stream and change your graphics settings (e.g., resolution)
-6. **End the stream** (quit the app on your client or disconnect)
-7. **Check that the game reverted:** Restart the game locally (not streaming) — your graphics settings should be back to what they were before the stream
+6. **End the stream** — test BOTH of these separately, since they behave differently:
+   - **(a) Quit the app properly on the client.** This runs `undo`, which immediately restores your local config to disk. Restart the game locally right away — your graphics settings should already be back to what they were before the stream.
+   - **(b) Disconnect without quitting the client app** (e.g., close the client window, lose network). `undo` does NOT run in this case — this is expected, not a bug. Your disk stays in the streamed client's config until the *next* time you start a stream (any client); that next `do` reconciles the orphaned session automatically (see README's "Automatic Crash/Disconnect Recovery"). If you restart the game locally right after a disconnect, don't be surprised to still see the client's settings — start one more stream and quit it properly (case a) to get your local config back immediately.
 
-If all of this works as expected, installation is complete!
+If case (a) works as expected, installation is complete! Case (b) is just there so you know what "not reverted yet" looks like and don't mistake it for a broken install.
 
 ---
 
@@ -130,7 +131,7 @@ If you need to remove this tool:
 2. **Delete both commands** (the "do" and "undo" entries pointing to `sync-configs.ps1`)
 3. **Delete the folder** `C:\stream-config-profiles` from your disk
 
-Your game settings will not be affected — the tool backs up your original config and always restores it after a stream ends.
+Your game settings are safe as long as your last session ended cleanly (the client app was properly quit, so `undo` ran and restored your local config to disk). If your last stream instead ended by disconnect rather than quitting the client, `undo` never ran and your disk may still hold that client's settings — start one more stream and properly quit it before uninstalling, so your local config is restored first. You can also check `state.json` in the install folder: if it exists and lists an `activeClient`, a session is still pending.
 
 ---
 
@@ -140,6 +141,11 @@ Your game settings will not be affected — the tool backs up your original conf
 - Check that Vibepollo can access the path (permissions, typos in the command)
 - Open `Command Prompt` or `PowerShell` and manually run the command to see any error messages:
   ```
+  powershell.exe -ExecutionPolicy Bypass -File "C:\stream-config-profiles\sync-configs.ps1" -Mode do
+  ```
+  **Important:** the script intentionally does nothing at all — no log, no output, no error, just a silent successful exit — unless it sees `APOLLO_CLIENT_NAME` (or `SUNSHINE_CLIENT_NAME`) set in its environment, since that's how it knows a stream is actually starting. Outside of an actual stream, that variable isn't set. To test manually in the same PowerShell window, set it first:
+  ```
+  $env:APOLLO_CLIENT_NAME = "TestClient"
   powershell.exe -ExecutionPolicy Bypass -File "C:\stream-config-profiles\sync-configs.ps1" -Mode do
   ```
 

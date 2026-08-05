@@ -51,8 +51,13 @@ stream-config-profiles\
     └── ...
 ```
 
-- `<hash8>` = first 8 hex chars of MD5 of the lowercased full path — avoids
-  collisions between games whose config files share a name (settings.ini).
+- `<hash8>` = first 8 hex chars of MD5 of the lowercased full path, with any
+  trailing path separator (`\` or `/`) removed before hashing — avoids
+  collisions between games whose config files share a name (settings.ini),
+  and makes `C:\Foo` and `C:\Foo\` resolve to the same profile entry.
+  Trailing separators are in fact stripped once, when a path is read out of
+  paths.txt (see below), so every consumer (hashing, copying, logging)
+  works from the same normalized string.
 - Client name comes from env: `APOLLO_CLIENT_NAME`, fallback
   `SUNSHINE_CLIENT_NAME`. Sanitize for filesystem use. If neither is set,
   exit 0 doing nothing (not a streaming session).
@@ -70,6 +75,12 @@ stream-config-profiles\
 
 - No quotes, even with spaces (the whole line is the path).
 - Expand environment variables (`%LOCALAPPDATA%` etc.) when reading.
+- Strip any trailing `\` or `/` after expansion (unless doing so would leave
+  a bare drive letter like `C:`). This avoids a Windows PowerShell 5.1
+  native-argv quoting hazard where a path that both contains a space and
+  ends in `\` gets mis-parsed by robocopy.exe, and keeps the hash8/leaf
+  computation, the copy call, and the log line all working from one
+  consistent string.
 
 ## Core semantics — save-at-start with state.json
 
@@ -119,9 +130,12 @@ Absent/empty file = no pending session.
 ## Copy semantics
 
 - Single file: `Copy-Item -Force` (create destination dir as needed).
-- Folder: `robocopy <src> <dst> /R:1 /W:1 /NFL /NDL /NJH /NJS` — overwrite,
-  never delete extra files (safe default for folders that mix configs with
-  other data). `/MIR` explicitly NOT used in v1.
+- Folder: `robocopy <src> <dst> /E /R:1 /W:1 /NFL /NDL /NJH /NJS` — recurse
+  into subfolders (`/E`; without it, real robocopy copies only the
+  top-level files of a folder and silently skips nested content — the
+  opposite of what "folders that mix configs with other data" requires),
+  overwrite, never delete extra files (safe default). `/MIR` explicitly NOT
+  used in v1.
 - robocopy exit codes ≥ 8 are errors; < 8 is success.
 
 ## Error handling

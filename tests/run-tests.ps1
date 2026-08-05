@@ -76,21 +76,44 @@ function Test-IsWindowsPlatform {
 
 function New-RobocopyShim {
     # Bash shim used when this harness itself runs on Linux/macOS.
+    #
+    # Faithfully mimics real robocopy's /E-gated recursion (no /E or /S ->
+    # top-level files only, subfolders silently skipped) instead of always
+    # recursing -- a harness that always recurses regardless of flags would
+    # mask exactly the class of bug where sync-configs.ps1 forgets to pass
+    # /E to robocopy.
+    #
+    # Honors $env:SHIM_ROBOCOPY_RC (if set and non-empty) to force a
+    # specific exit code after performing the copy, so a scenario can
+    # exercise sync-configs.ps1's "rc >= 8 is an error" handling -- a path
+    # real robocopy failures take but that a harness with only one hardcoded
+    # exit code could never reach.
     $shPath = Join-Path $script:ShimDir 'robocopy'
     $shContent = @'
 #!/usr/bin/env bash
 # Minimal robocopy-compatible shim for non-Windows test runs.
 # Mimics the exact subset sync-configs.ps1 relies on:
-#   - copy contents of SRC into DST (recursively)
+#   - copy contents of SRC into DST
+#   - recurse into subfolders ONLY if /E or /S is present among the flags
+#     (real robocopy default with neither is top-level-files-only)
 #   - overwrite files that already exist in DST
 #   - NEVER delete anything already in DST that isn't in SRC (no /MIR)
 #   - create DST if it doesn't exist
-#   - ignore all robocopy flags (/R:1 /W:1 /NFL /NDL /NJH /NJS ...)
-#   - exit with a robocopy "success" code (< 8); we always use 1
-#     ("one or more files copied successfully").
+#   - exit with a robocopy "success" code (< 8) by default -- 1 ("one or
+#     more files copied successfully") -- unless SHIM_ROBOCOPY_RC overrides it
 set -u
 src="${1:-}"
 dst="${2:-}"
+shift 2 2>/dev/null || true
+
+recurse=0
+for arg in "$@"; do
+    case "$arg" in
+        /E|/e|/S|/s)
+            recurse=1
+            ;;
+    esac
+done
 
 if [ -z "$src" ] || [ -z "$dst" ]; then
     exit 16
@@ -104,7 +127,15 @@ if [ ! -d "$src" ]; then
     exit 16
 fi
 
-cp -a "$src"/. "$dst"/ 2>/dev/null
+if [ "$recurse" = "1" ]; then
+    cp -a "$src"/. "$dst"/ 2>/dev/null
+else
+    find "$src" -maxdepth 1 -mindepth 1 -type f -exec cp -p {} "$dst"/ \; 2>/dev/null
+fi
+
+if [ -n "${SHIM_ROBOCOPY_RC:-}" ]; then
+    exit "$SHIM_ROBOCOPY_RC"
+fi
 
 exit 1
 '@ -replace "`r`n", "`n"
@@ -121,11 +152,23 @@ exit 1
     $cmdPath = Join-Path $script:ShimDir 'robocopy.cmd'
     $cmdContent = @'
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 set "SRC=%~1"
 set "DST=%~2"
+set "RECURSE=0"
+for %%A in (%*) do (
+    if /I "%%~A"=="/E" set "RECURSE=1"
+    if /I "%%~A"=="/S" set "RECURSE=1"
+)
 if not exist "%DST%\" mkdir "%DST%" >nul 2>&1
-xcopy "%SRC%\*" "%DST%\" /E /Y /I /Q >nul 2>&1
+if "%RECURSE%"=="1" (
+    xcopy "%SRC%\*" "%DST%\" /E /Y /I /Q >nul 2>&1
+) else (
+    xcopy "%SRC%\*" "%DST%\" /Y /I /Q >nul 2>&1
+)
+if defined SHIM_ROBOCOPY_RC (
+    exit /b %SHIM_ROBOCOPY_RC%
+)
 exit /b 1
 '@ -replace "`n", "`r`n"
     Set-Content -LiteralPath $cmdPath -Value $cmdContent -Encoding ASCII
@@ -558,6 +601,235 @@ Invoke-Scenario -Name 'T9: client name needing sanitization works without crashi
     }
 
     Assert-That ((Read-TextFile $fileT9) -eq 'T9:ORIGINAL') 'disk content must be unaffected by sanitization handling'
+} | Out-Null
+
+# ===========================================================================
+# T10 — corrupt/truncated state.json must NOT be treated as "clean": the
+# _local backup step must be skipped entirely rather than overwriting the
+# true local config with whatever's on disk (which is presumably the
+# interrupted previous client's session).
+# ===========================================================================
+
+Invoke-Scenario -Name 'T10: corrupt state.json -> _local left untouched, do still succeeds' -Body {
+    $sb = New-Sandbox -Label 'T10'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T10:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    # Establish a known-good _local via one clean 'do'.
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'ClientX'
+    Assert-That ($rc1 -eq 0) "first do exit code expected 0, got $rc1"
+    $localDir = Join-Path $sb.ProfilesDir '_local'
+    Assert-That ((Read-TextFile (Join-Path $localDir $entry)) -eq 'T10:ORIGINAL') '_local should hold the original content after the first clean do'
+
+    # Simulate an interrupted write leaving state.json truncated/corrupt,
+    # and disk holding whatever ClientX's session left behind.
+    Write-TextFile -Path $sb.StateFile -Content '{"activeClient":"Clie'
+    Write-TextFile -Path $f -Content 'T10:CLIENTX_LEFTOVER'
+
+    $rc2 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'ClientY'
+    Assert-That ($rc2 -eq 0) "second do (corrupt state) exit code expected 0, got $rc2"
+
+    Assert-That ((Read-TextFile (Join-Path $localDir $entry)) -eq 'T10:ORIGINAL') '_local must remain the ORIGINAL content -- corrupt state.json must not trigger a fresh _local backup'
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'action=state-corrupt\b') 'sync.log should record state-corrupt'
+    Assert-That ($null -ne $log -and $log -match 'action=state-corrupt-skip-local-backup') 'sync.log should record that the _local backup was skipped'
+
+    # The incoming client (ClientY) should still be served normally.
+    $clientYDir = Join-Path $sb.ProfilesDir 'ClientY'
+    Assert-That (Test-Path -LiteralPath $clientYDir) 'ClientY profile dir should still be created despite the corrupt state.json'
+    Assert-That ((Read-TextFile (Join-Path $clientYDir $entry)) -eq 'T10:CLIENTX_LEFTOVER') 'ClientY should be seeded from current (leftover) disk state'
+} | Out-Null
+
+# ===========================================================================
+# T11 — state.json activeClient == "_local": must not let a pending-session
+# save collide with (overwrite) the reserved _local profile.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T11: state.json activeClient="_local" cannot clobber the real _local profile' -Body {
+    $sb = New-Sandbox -Label 'T11'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T11:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'ClientX'
+    Assert-That ($rc1 -eq 0) "first do exit code expected 0, got $rc1"
+    $localDir = Join-Path $sb.ProfilesDir '_local'
+    Assert-That ((Read-TextFile (Join-Path $localDir $entry)) -eq 'T11:ORIGINAL') '_local should hold the original content'
+
+    # Hand-edit state.json so activeClient is literally the reserved name.
+    Write-TextFile -Path $sb.StateFile -Content '{"activeClient":"_local","since":"2020-01-01T00:00:00Z","localBackedUp":true}'
+    Write-TextFile -Path $f -Content 'T11:PENDING_DISK_STATE'
+
+    $rc2 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'ClientY'
+    Assert-That ($rc2 -eq 0) "second do exit code expected 0, got $rc2"
+
+    Assert-That ((Read-TextFile (Join-Path $localDir $entry)) -eq 'T11:ORIGINAL') '_local must remain untouched/original -- a pending client literally named "_local" must never be allowed to write into it'
+
+    # No directory literally named "_local" other than the one true local
+    # profile should exist, and it must still hold the original content
+    # (not the pending disk state) -- proving the pending save landed
+    # somewhere sanitized, not on top of _local.
+    $local1 = Get-ChildItem -LiteralPath $sb.ProfilesDir -Directory | Where-Object { $_.Name -ieq '_local' }
+    Assert-That (@($local1).Count -eq 1) 'exactly one _local directory should exist'
+} | Out-Null
+
+# ===========================================================================
+# T12 — state.json activeClient containing path-traversal characters must
+# never cause a write outside profiles\.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T12: state.json activeClient with traversal characters cannot escape profiles\' -Body {
+    $sb = New-Sandbox -Label 'T12'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T12:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'ClientX'
+    Assert-That ($rc1 -eq 0) "first do exit code expected 0, got $rc1"
+    $localDir = Join-Path $sb.ProfilesDir '_local'
+
+    Write-TextFile -Path $sb.StateFile -Content '{"activeClient":"../../escaped","since":"2020-01-01T00:00:00Z","localBackedUp":true}'
+    Write-TextFile -Path $f -Content 'T12:PENDING_DISK_STATE'
+
+    $rc2 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'ClientY'
+    Assert-That ($rc2 -eq 0) "second do exit code expected 0, got $rc2"
+
+    Assert-That ((Read-TextFile (Join-Path $localDir $entry)) -eq 'T12:ORIGINAL') '_local must remain untouched by a traversal-shaped pending client name'
+
+    $escapedOutside = Join-Path $sb.Root 'escaped'
+    Assert-That (-not (Test-Path -LiteralPath $escapedOutside)) 'nothing should be written outside profiles\ (no "escaped" dir at the sandbox root)'
+    $escapedOutsideInstall = Join-Path $sb.InstallDir 'escaped'
+    Assert-That (-not (Test-Path -LiteralPath $escapedOutsideInstall)) 'nothing should be written outside profiles\ (no "escaped" dir in the install dir)'
+
+    # Every directory actually created under profiles\ must stay under it
+    # and have no path-separator characters left in its name.
+    Get-ChildItem -LiteralPath $sb.ProfilesDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        Assert-That ($_.Name -notmatch '[\\/]') "profile directory name '$($_.Name)' must not contain path separators"
+    }
+} | Out-Null
+
+# ===========================================================================
+# T13 — a second, spurious 'undo' (no pending session) must be a no-op: it
+# must not overwrite the client's profile with the already-restored local
+# config.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T13: double-undo does not clobber the client profile' -Body {
+    $sb = New-Sandbox -Label 'T13'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T13:LOCAL_ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    $rc1 = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'iPad'
+    Assert-That ($rc1 -eq 0) "do exit code expected 0, got $rc1"
+
+    Write-TextFile -Path $f -Content 'T13:IPAD_CHANGED'
+    $rc2 = Invoke-Sync -Sandbox $sb -Mode 'undo' -ApolloClient 'iPad'
+    Assert-That ($rc2 -eq 0) "first undo exit code expected 0, got $rc2"
+
+    $iPadDir = Join-Path $sb.ProfilesDir 'iPad'
+    Assert-That ((Read-TextFile (Join-Path $iPadDir $entry)) -eq 'T13:IPAD_CHANGED') 'iPad profile should hold the changed content after the first (real) undo'
+    Assert-That ((Read-TextFile $f) -eq 'T13:LOCAL_ORIGINAL') 'disk should be back to local after the first undo'
+    Assert-That (-not (Test-Path -LiteralPath $sb.StateFile)) 'state.json should be cleared after the first undo'
+
+    # A second undo with no pending session must do nothing.
+    $rc3 = Invoke-Sync -Sandbox $sb -Mode 'undo' -ApolloClient 'iPad'
+    Assert-That ($rc3 -eq 0) "second (spurious) undo exit code expected 0, got $rc3"
+
+    Assert-That ((Read-TextFile (Join-Path $iPadDir $entry)) -eq 'T13:IPAD_CHANGED') 'iPad profile must NOT be overwritten by a spurious second undo'
+    Assert-That ((Read-TextFile $f) -eq 'T13:LOCAL_ORIGINAL') 'disk should remain local config after the spurious second undo'
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'action=undo-no-pending-session') 'sync.log should record the spurious undo as a no-op'
+} | Out-Null
+
+# ===========================================================================
+# T14 — an invalid -Mode value must still exit 0 (Vibepollo must never be
+# blocked by a mangled prep-command argument).
+# ===========================================================================
+
+Invoke-Scenario -Name 'T14: invalid -Mode value still exits 0' -Body {
+    $sb = New-Sandbox -Label 'T14'
+    Remove-Item Env:\APOLLO_CLIENT_NAME -ErrorAction SilentlyContinue
+    Remove-Item Env:\SUNSHINE_CLIENT_NAME -ErrorAction SilentlyContinue
+
+    $global:LASTEXITCODE = $null
+    & $script:PwshExe -NoProfile -File $sb.ScriptPath -Mode 'bogus' | Out-Null
+    $rc = $LASTEXITCODE
+    Assert-That ($rc -eq 0) "exit code for an invalid -Mode expected 0, got $rc"
+} | Out-Null
+
+# ===========================================================================
+# T15 — SUNSHINE_CLIENT_NAME fallback (used only when APOLLO_CLIENT_NAME is
+# absent) must work end-to-end.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T15: SUNSHINE_CLIENT_NAME fallback works when APOLLO_CLIENT_NAME is unset' -Body {
+    $sb = New-Sandbox -Label 'T15'
+    $f = Join-Path $sb.Root 'game-configs/settings.ini'
+    Write-TextFile -Path $f -Content 'T15:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($f)
+    $entry = Test-ProfileEntryName -Path $f
+
+    $rc = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient $null -SunshineClient 'SunshineClient'
+    Assert-That ($rc -eq 0) "exit code expected 0, got $rc"
+
+    $clientDir = Join-Path $sb.ProfilesDir 'SunshineClient'
+    Assert-That (Test-Path -LiteralPath $clientDir) 'SunshineClient profile dir should be created via the SUNSHINE_CLIENT_NAME fallback'
+    Assert-That ((Read-TextFile (Join-Path $clientDir $entry)) -eq 'T15:ORIGINAL') 'SunshineClient profile should be seeded correctly'
+} | Out-Null
+
+# ===========================================================================
+# T16 — a robocopy failure (rc >= 8) must be logged as an error and the
+# process must still exit 0.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T16: forced robocopy failure (rc>=8) is logged as an error, process still exits 0' -Body {
+    $sb = New-Sandbox -Label 'T16'
+    $folderDir = Join-Path $sb.Root 'game-configs/failfolder'
+    Write-TextFile -Path (Join-Path $folderDir 'file1.txt') -Content 'F1:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @($folderDir)
+
+    $env:SHIM_ROBOCOPY_RC = '16'
+    try {
+        $rc = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'FailClient'
+    }
+    finally {
+        Remove-Item Env:\SHIM_ROBOCOPY_RC -ErrorAction SilentlyContinue
+    }
+    Assert-That ($rc -eq 0) "exit code expected 0 even when robocopy fails, got $rc"
+
+    $log = Read-TextFile $sb.LogFile
+    Assert-That ($null -ne $log -and $log -match 'action=[a-z-]*error-robocopy-16') 'sync.log should record the forced robocopy failure with its exit code'
+} | Out-Null
+
+# ===========================================================================
+# T17 — a folder path listed with a trailing separator normalizes to the
+# SAME profile entry as the same folder listed without one.
+# ===========================================================================
+
+Invoke-Scenario -Name 'T17: trailing separator on a folder path normalizes to a single profile entry' -Body {
+    $sb = New-Sandbox -Label 'T17'
+    $folderDir = Join-Path $sb.Root 'game-configs/trailingsepfolder'
+    Write-TextFile -Path (Join-Path $folderDir 'file1.txt') -Content 'F1:ORIGINAL'
+    Set-PathsFile -Sandbox $sb -Lines @(($folderDir + '/'))
+
+    $rc = Invoke-Sync -Sandbox $sb -Mode 'do' -ApolloClient 'SepClient'
+    Assert-That ($rc -eq 0) "exit code expected 0, got $rc"
+
+    $expectedEntry = Test-ProfileEntryName -Path $folderDir
+    $localDir = Join-Path $sb.ProfilesDir '_local'
+    $entryDir = Join-Path $localDir $expectedEntry
+    Assert-That (Test-Path -LiteralPath $entryDir) "expected a single normalized profile entry '$expectedEntry' under _local"
+
+    $allEntries = @(Get-ChildItem -LiteralPath $localDir -Directory -ErrorAction SilentlyContinue)
+    Assert-That ($allEntries.Count -eq 1) "expected exactly one profile entry under _local, found $($allEntries.Count): $($allEntries.Name -join ', ')"
 } | Out-Null
 
 # ===========================================================================

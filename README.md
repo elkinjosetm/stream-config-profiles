@@ -13,7 +13,7 @@ Streaming the same PC to multiple clients (iPad @ 1080p/120, Apple TV @ 1440p/60
 ### Per-Client Profiles + The Implicit Local Profile
 
 The tool maintains a folder structure under `profiles/`:
-- **`profiles/_local/`** — Your PC's own graphics settings (created automatically, preserved from before installation)
+- **`profiles/_local/`** — Your PC's own graphics settings, created automatically and refreshed every time you start a clean streaming session (it's overwritten with whatever your local config was immediately before that session began — not a one-time snapshot taken at install time)
 - **`profiles/<ClientName>/`** — One profile per streaming client (iPad, AppleTV, Monitor, etc.)
 
 Each profile contains copies of the config files/folders you list in `paths.txt`.
@@ -22,7 +22,9 @@ Each profile contains copies of the config files/folders you list in `paths.txt`
 
 The tool uses a two-phase strategy designed to survive crashes and unexpected disconnects:
 
-1. **At session start (`do`)**: Before restoring a client's profile, save the current disk state to that client's profile folder. This handles the case where a previous session ended abnormally (crash, network disconnect) and `undo` never ran. The pending session's changes are preserved automatically.
+1. **At session start (`do`)**: Before restoring the incoming client's profile, the tool saves the current disk state somewhere first — where depends on what happened last time:
+   - **If a previous session never got a proper `undo`** (crash, network disconnect): the current disk state is that orphaned client's own settings, so it's saved back into *that client's* profile folder. `_local` is left untouched, since it still holds the true local config from before that orphaned session started.
+   - **Otherwise (the normal case)**: the current disk state is your own local settings, so it's saved into `profiles/_local/` (overwriting the previous `_local` snapshot) before the incoming client's profile is restored.
 
 2. **At session end (`undo`)**: Save the client's latest config, then restore `_local/` to the disk so your PC returns to its own settings.
 
