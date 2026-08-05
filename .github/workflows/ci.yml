@@ -53,15 +53,89 @@ jobs:
       # (e.g. `${{ matrix.shell }}`) -- it must be a hardcoded value -- so
       # each candidate shell gets its own step gated by an `if:` on the
       # matrix value instead.
-      - name: Run test suite (Windows PowerShell 5.1)
+      - name: Run engine test suite (Windows PowerShell 5.1)
         if: matrix.shell == 'powershell'
         shell: powershell
         run: ./tests/run-tests.ps1
 
-      - name: Run test suite (pwsh)
+      - name: Run engine test suite (pwsh)
         if: matrix.shell == 'pwsh'
         shell: pwsh
         run: ./tests/run-tests.ps1
+
+      # manager-tests.ps1 covers manager.ps1 (the v2 install/registration/
+      # watchdog app) the same way run-tests.ps1 covers sync-configs.ps1
+      # (the engine) above -- both suites must pass on every leg. Split
+      # into two steps for the same reason as above: `shell:` does not
+      # accept a matrix expression, so each candidate shell gets its own
+      # step gated by `if:`.
+      - name: Run manager test suite (Windows PowerShell 5.1)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./tests/manager-tests.ps1
+
+      - name: Run manager test suite (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: ./tests/manager-tests.ps1
+
+  build-dist:
+    name: Build dist + verify payload duality (dev + release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # release.yml's own build job only parse-checks dist/manager.ps1 --
+      # a parse-only check passes just as happily on a dist file whose
+      # payload slots were never actually replaced (still bare markers) or
+      # landed in the wrong slot, which would ship a "self-contained"
+      # dist/manager.ps1 that silently falls back to dev mode and throws
+      # "embedded payload is empty" on the end user's machine. Running
+      # make-dist.ps1 here, per-PR, plus the assertion below, is what
+      # SPEC.md's "verify both payload modes (dev + release)" actually
+      # requires -- release.yml alone only re-discovers a broken build
+      # script after a version tag has already been pushed.
+      - name: Run build/make-dist.ps1
+        shell: pwsh
+        run: ./build/make-dist.ps1
+
+      - name: Verify dist/manager.ps1's embedded payload is byte-identical to source
+        shell: pwsh
+        run: |
+          . ./dist/manager.ps1 -NoRun
+
+          # ScriptDir points at a directory with no sync-configs.ps1 /
+          # paths.example.txt neighbors, so a fall-through to dev-mode file
+          # lookup would throw here instead of silently masking a build
+          # that failed to actually embed the payload.
+          $emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Path $emptyDir -Force | Out-Null
+
+          $engineFromDist = Get-EnginePayload -ScriptDir $emptyDir
+          $templateFromDist = Get-TemplatePayload -ScriptDir $emptyDir
+          $engineSource = Get-Content -LiteralPath 'sync-configs.ps1' -Raw -Encoding UTF8
+          $templateSource = Get-Content -LiteralPath 'paths.example.txt' -Raw -Encoding UTF8
+
+          if ($engineFromDist -ne $engineSource) {
+              throw 'dist/manager.ps1 embedded engine payload does not match sync-configs.ps1 byte-for-byte'
+          }
+          if ($templateFromDist -ne $templateSource) {
+              throw 'dist/manager.ps1 embedded template payload does not match paths.example.txt byte-for-byte'
+          }
+          Write-Host 'dist/manager.ps1 payload verified byte-identical to source (release mode).' -ForegroundColor Green
+
+          # Dev mode: the repo's own manager.ps1 (payload slots still bare
+          # markers) must fall back to its neighbor files unchanged.
+          . ./manager.ps1 -NoRun
+          $engineFromDev = Get-EnginePayload -ScriptDir '.'
+          $templateFromDev = Get-TemplatePayload -ScriptDir '.'
+          if ($engineFromDev -ne $engineSource) {
+              throw 'manager.ps1 dev-mode engine payload does not match sync-configs.ps1 byte-for-byte'
+          }
+          if ($templateFromDev -ne $templateSource) {
+              throw 'manager.ps1 dev-mode template payload does not match paths.example.txt byte-for-byte'
+          }
+          Write-Host 'manager.ps1 dev-mode payload verified byte-identical to source.' -ForegroundColor Green
 
   lint:
     name: Lint (PSScriptAnalyzer)
@@ -88,7 +162,7 @@ jobs:
           # passing an array of paths gets silently space-joined by
           # PowerShell's parameter binder into one nonexistent path. Invoke
           # once per target file and aggregate instead.
-          $targets = @('sync-configs.ps1', 'tests/run-tests.ps1')
+          $targets = @('sync-configs.ps1', 'tests/run-tests.ps1', 'manager.ps1', 'tests/manager-tests.ps1', 'build/make-dist.ps1')
           foreach ($t in $targets) {
               if (-not (Test-Path -LiteralPath $t)) {
                   throw "lint target not found: $t"

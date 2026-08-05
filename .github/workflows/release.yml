@@ -1,0 +1,206 @@
+name: Release
+
+# Fires only on an actual version tag push (v1.2.3, v2.0.0-rc1, ...) -- never
+# on a branch push -- so a release is always the result of a deliberate
+# `git tag vX.Y.Z && git push --tags`, not an accident of merging to main.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Default to the minimum (read-only) grant; the one job that needs more
+# (release) opts in explicitly below. Keeping this at the workflow level
+# means a future job added here starts read-only unless it says otherwise.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # (a) Quick gate: both test suites, ubuntu/pwsh only. This is a fast
+  # sanity check at tag time, not a substitute for ci.yml's full
+  # Windows-PowerShell-5.1 / pwsh-Windows / pwsh-Linux matrix -- that
+  # matrix already ran (and had to pass) on the commit being tagged, via
+  # ci.yml's own push/pull_request triggers, before this tag ever existed.
+  # ---------------------------------------------------------------------
+  test:
+    name: Quick test gate (pwsh / ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      # v4.4.0. Pinned to a full commit SHA rather than a mutable tag: a
+      # compromised or retagged upstream action would otherwise execute
+      # unreviewed in every job that follows.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Run engine test suite
+        shell: pwsh
+        run: ./tests/run-tests.ps1
+
+      - name: Run manager test suite
+        shell: pwsh
+        run: ./tests/manager-tests.ps1
+
+  # ---------------------------------------------------------------------
+  # (b) Build: inline the payload slots to produce a self-contained
+  # dist\manager.ps1 + dist\Install.bat, then verify the result. A
+  # parse-check alone passes just as happily on a dist file whose payload
+  # slots were never actually replaced (still bare markers, falling back
+  # to dev mode) or landed in the wrong slot -- see the byte-identical
+  # payload assertion below, which is what SPEC.md's "verify both payload
+  # modes (dev + release)" actually requires. ci.yml's build-dist job runs
+  # the identical assertion per-PR, so a broken build script is caught
+  # long before a tag is ever pushed.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build dist
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Run build/make-dist.ps1
+        shell: pwsh
+        run: ./build/make-dist.ps1
+
+      - name: Parse-check dist/manager.ps1
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile('dist/manager.ps1', [ref]$tokens, [ref]$parseErrors) | Out-Null
+          if (@($parseErrors).Count -gt 0) {
+              Write-Host 'Parse errors in dist/manager.ps1:' -ForegroundColor Red
+              $parseErrors | Format-List | Out-String -Width 4096 | Write-Host
+              throw "dist/manager.ps1 failed to parse ($(@($parseErrors).Count) error(s))"
+          }
+          Write-Host 'dist/manager.ps1 parses cleanly.' -ForegroundColor Green
+
+      - name: Verify dist/manager.ps1's embedded payload is byte-identical to source
+        shell: pwsh
+        run: |
+          . ./dist/manager.ps1 -NoRun
+
+          # ScriptDir points at a directory with no sync-configs.ps1 /
+          # paths.example.txt neighbors, so a fall-through to dev-mode file
+          # lookup would throw here instead of silently masking a build
+          # that failed to actually embed the payload.
+          $emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Path $emptyDir -Force | Out-Null
+
+          $engineFromDist = Get-EnginePayload -ScriptDir $emptyDir
+          $templateFromDist = Get-TemplatePayload -ScriptDir $emptyDir
+          $engineSource = Get-Content -LiteralPath 'sync-configs.ps1' -Raw -Encoding UTF8
+          $templateSource = Get-Content -LiteralPath 'paths.example.txt' -Raw -Encoding UTF8
+
+          if ($engineFromDist -ne $engineSource) {
+              throw 'dist/manager.ps1 embedded engine payload does not match sync-configs.ps1 byte-for-byte -- refusing to release'
+          }
+          if ($templateFromDist -ne $templateSource) {
+              throw 'dist/manager.ps1 embedded template payload does not match paths.example.txt byte-for-byte -- refusing to release'
+          }
+          Write-Host 'dist/manager.ps1 payload verified byte-identical to source.' -ForegroundColor Green
+
+      - name: Verify dist/Install.bat was produced
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'dist/Install.bat')) {
+              throw 'dist/Install.bat was not produced by make-dist.ps1'
+          }
+          Write-Host 'dist/Install.bat present.' -ForegroundColor Green
+
+      - name: Upload dist as a build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: |
+            dist/manager.ps1
+            dist/Install.bat
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # (c) Release: download the build artifact, generate SHA256SUMS.txt,
+  # attest build provenance for the dist artifacts, then attach
+  # everything to a GitHub Release for this tag.
+  # ---------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the Release and upload assets to it
+      id-token: write       # required by actions/attest-build-provenance
+      attestations: write   # required by actions/attest-build-provenance
+    env:
+      # Passed through the environment rather than interpolated directly
+      # into a run: script (${{ github.ref_name }} inline in a bash block
+      # below): GitHub Actions substitutes expressions textually BEFORE
+      # the shell ever sees them, and ref names permit $, `, (, ), ;, &
+      # and | -- a tag like 'v1.0.0$(curl ...)' would otherwise execute
+      # arbitrary shell commands inside a job holding contents: write,
+      # id-token: write and attestations: write. Creating a tag typically
+      # bypasses the branch-protection/review controls that guard normal
+      # code changes, so this is the difference between "can push a tag"
+      # and "can run arbitrary code with the release token".
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Validate tag format
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::Unexpected tag format: $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Download dist build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      - name: Generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $files = Get-ChildItem -LiteralPath 'dist' -File | Sort-Object -Property Name
+          if (@($files).Count -eq 0) {
+              throw 'no files found in dist/ to hash -- did the build job upload correctly?'
+          }
+          $lines = New-Object System.Collections.Generic.List[string]
+          foreach ($f in $files) {
+              $hash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $lines.Add("$hash  $($f.Name)")
+          }
+          $sumsPath = Join-Path 'dist' 'SHA256SUMS.txt'
+          $content = [string]::Join("`n", $lines.ToArray()) + "`n"
+          [System.IO.File]::WriteAllText($sumsPath, $content, $utf8NoBom)
+          Write-Host "Wrote $sumsPath :"
+          Get-Content -LiteralPath $sumsPath | Write-Host
+
+      - name: Attest build provenance for dist artifacts
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          # SHA256SUMS.txt included alongside the binaries it hashes --
+          # install.md/README point users at this file to verify their
+          # download, so an attestation that skipped it would vouch for
+          # the binaries while leaving the verification file itself
+          # unattested (a tampered SHA256SUMS.txt could then vouch for a
+          # tampered download).
+          subject-path: |
+            dist/manager.ps1
+            dist/Install.bat
+            dist/SHA256SUMS.txt
+
+      - name: Create GitHub Release and attach dist assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/manager.ps1 \
+            dist/Install.bat \
+            dist/SHA256SUMS.txt \
+            --title "$RELEASE_TAG" \
+            --generate-notes
