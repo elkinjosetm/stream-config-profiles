@@ -1,0 +1,6 @@
+# One path per line. File or folder — detected automatically.
+# Blank lines and lines starting with # are ignored.
+# Comments let the user remember which game each path belongs to.
+
+# Forza Horizon 6 (graphics config only, not saves)
+# %LOCALAPPDATA%\ForzaHorizon6\LocalStorage_Shared\ForzaUserConfigSelections
