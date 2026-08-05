@@ -41,7 +41,11 @@ edited profile, each client loads its own resolution correctly.
 ```
 stream-config-profiles\
 ├── sync-configs.ps1     # the only executable piece; called by Vibepollo
-├── paths.txt            # user-edited: one path per line
+├── paths.example.txt    # shipped template; committed to the repo
+├── paths.txt            # user-edited: one path per line; created by the
+│                         # user from paths.example.txt during install;
+│                         # gitignored (keeps local config paths out of
+│                         # version control)
 ├── state.json           # written by the script; session state
 ├── sync.log             # append-only log
 └── profiles\            # created automatically
@@ -50,6 +54,14 @@ stream-config-profiles\
     │   └── <hash8>_<leaf>   # per-path profile copy
     └── ...
 ```
+
+If `paths.txt` is missing entirely (e.g. the user skipped the copy step),
+`sync-configs.ps1` logs a `paths-file-missing` line and continues with zero
+configured paths (still exits 0). This does NOT skip folder/state creation:
+`profiles\_local\` and `profiles\<ClientName>\` are still created (empty),
+and state.json is still written with an `activeClient` — the tool looks
+exactly as "working" as it does with paths configured, just with nothing
+inside the profile folders.
 
 - `<hash8>` = first 8 hex chars of MD5 of the lowercased full path, with any
   trailing path separator (`\` or `/`) removed before hashing — avoids
