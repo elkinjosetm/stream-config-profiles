@@ -112,6 +112,21 @@ function New-ShortcutFile {
 }
 
 # ---------------------------------------------------------------------------
+# User-identity shim -- redefine Get-CurrentWindowsUserSid, the one function
+# Get-ResolvedUserId isolates its WindowsIdentity.GetCurrent() SID lookup
+# behind, so the "no SID available" fallback branch (DOMAIN\User / bare
+# USERNAME) is exercised deterministically on EVERY platform this harness
+# runs on -- including real Windows CI, where a SID is always genuinely
+# available and the un-shimmed code path could never reach that branch at
+# all. Always returns $null (never a real SID); no test here needs the real
+# platform SID.
+# ---------------------------------------------------------------------------
+
+function Get-CurrentWindowsUserSid {
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------------
 
@@ -823,27 +838,43 @@ Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString keeps a space
 } | Out-Null
 
 Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString renders switch/bool/int parameters correctly' -Body {
+    # Contract (see ConvertTo-ElevatedArgumentString's own comment): a
+    # present/true switch renders as a BARE -Name token; an absent/false
+    # switch is OMITTED entirely. Never an explicit -Name:$true/-Name:
+    # $false token -- powershell.exe/pwsh invoked with -File (exactly how
+    # Invoke-Elevated always re-launches this script) parses script
+    # arguments as literal, unevaluated strings, so an explicit ":$true"/
+    # ":$false" token fails to bind to a [SwitchParameter] at all (the
+    # actual field failure: "Cannot convert value "System.String" to type
+    # SwitchParameter").
     $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ RemoveData = [switch]$true; IncludePoll = [switch]$false; PollMinutes = 10 }
-    Assert-That ($argString -match '-RemoveData:\$true(?!\S)') 'a present switch should appear as an explicit -Name:$true token'
-    Assert-That ($argString -match '-IncludePoll:\$false(?!\S)') 'an absent switch must still appear as an explicit -Name:$false token (never silently omitted)'
+    Assert-That ($argString -match '(?<!\S)-RemoveData(?!\S)') 'a present switch should appear as a bare -Name token'
+    Assert-That ($argString -notmatch '-RemoveData:') 'a present switch must never render an explicit :$true/:$false value'
+    Assert-That ($argString -notmatch '-IncludePoll(?!\S)') 'an absent/false switch must be omitted entirely, not rendered as a bare flag'
+    Assert-That ($argString -notmatch '-IncludePoll:') 'an absent/false switch must never render an explicit :$true/:$false value either'
     Assert-That ($argString -match '-PollMinutes "10"') 'a non-string value should still be quoted'
 } | Out-Null
 
-Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString renders -IncludeLogon:$false explicitly -- regression for the field bug where an absent switch silently bound to its DECLARED default instead of the caller''s false' -Body {
-    # CRITICAL correctness: -IncludeLogon is declared [switch]$IncludeLogon =
-    # $true (default ON). ConvertTo-ElevatedArgumentString used to omit an
-    # absent/false switch entirely, which is only safe when the CALLED
-    # script's own default for that parameter is already $false -- true for
-    # -IncludePoll, but the exact opposite of -IncludeLogon's declared
-    # default. An omitted -IncludeLogon (meaning the caller passed
-    # [switch]$false) therefore bound to $true in the elevated child, which
-    # would silently re-register the Logon task a user had just declined
-    # via an elevated poll-only retry. Every switch must now render an
-    # explicit :$true/:$false token so correctness never depends on which
-    # way a given parameter's own default happens to point.
+Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString omits a caller-declined -IncludeLogon entirely -- regression for the field bug where an explicit -Name:$false token failed to bind at all across the real -File elevation boundary' -Body {
+    # CRITICAL correctness, and the root cause of the actual field failure:
+    # powershell.exe/pwsh invoked with -File (exactly how Invoke-Elevated
+    # always re-launches this script) parses script arguments as literal,
+    # unevaluated strings. An explicit "-IncludeLogon:$false"/
+    # "-IncludeLogon:$true" token therefore arrives as the bare string
+    # "$false"/"$true", which PowerShell's own parameter binder cannot
+    # convert to a [SwitchParameter] -- crashing the elevated child outright
+    # ("Cannot convert value "System.String" to type SwitchParameter"),
+    # regardless of which way -IncludeLogon's own declared default points.
+    # The fix is not which token to render for false vs. true; it is to
+    # never render an explicit value token AT ALL: a present switch is a
+    # BARE -Name, an absent one is OMITTED, and -IncludeLogon is declared
+    # with a $false default at every boundary this can cross (see its own
+    # comment) so that omission is sound.
     $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; IncludeLogon = [switch]$false; IncludePoll = [switch]$true; PollMinutes = 10 }
-    Assert-That ($argString -match '-IncludeLogon:\$false(?!\S)') 'a caller-declined -IncludeLogon must render as an explicit -IncludeLogon:$false token, never be silently omitted'
-    Assert-That ($argString -match '-IncludePoll:\$true(?!\S)') 'a caller-requested -IncludePoll must render as an explicit -IncludePoll:$true token'
+    Assert-That ($argString -notmatch '-IncludeLogon(?!\S)') 'a caller-declined -IncludeLogon must be omitted entirely, never rendered as a bare flag'
+    Assert-That ($argString -notmatch '-IncludeLogon:') 'a caller-declined -IncludeLogon must never render an explicit :$true/:$false value token'
+    Assert-That ($argString -match '(?<!\S)-IncludePoll(?!\S)') 'a caller-requested -IncludePoll must render as a bare -IncludePoll flag'
+    Assert-That ($argString -notmatch '-IncludePoll:') 'a caller-requested -IncludePoll must never render an explicit :$true value token'
 } | Out-Null
 
 Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString carries the ORIGINAL -UserId and -IncludeLogon through for a register-watchdog elevation retry' -Body {
@@ -854,8 +885,10 @@ Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString carries the O
     # (possibly different-admin) identity.
     $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; IncludeLogon = [switch]$true; IncludePoll = [switch]$false; PollMinutes = 15 }
     Assert-That ($argString -match '-UserId "OriginalInteractiveUser"') 'the elevated re-entry command line must carry the original UserId explicitly'
-    Assert-That ($argString -match '-IncludeLogon:\$true(?!\S)') 'a present -IncludeLogon should appear as an explicit -IncludeLogon:$true token'
-    Assert-That ($argString -match '-IncludePoll:\$false(?!\S)') 'an absent -IncludePoll should still appear as an explicit -IncludePoll:$false token'
+    Assert-That ($argString -match '(?<!\S)-IncludeLogon(?!\S)') 'a present -IncludeLogon should appear as a bare -IncludeLogon flag'
+    Assert-That ($argString -notmatch '-IncludeLogon:') 'a present -IncludeLogon must never render an explicit :$true value token'
+    Assert-That ($argString -notmatch '-IncludePoll(?!\S)') 'an absent -IncludePoll should be omitted entirely, not rendered as a bare flag'
+    Assert-That ($argString -notmatch '-IncludePoll:') 'an absent -IncludePoll must never render an explicit :$false value token either'
     Assert-That ($argString -match "-Action ""register-watchdog""") 'the re-entered action should be register-watchdog'
 } | Out-Null
 
@@ -878,13 +911,22 @@ Invoke-Scenario -Name 'Elevation (end-to-end): a poll-only elevation retry, run 
     # A 'StreamConfigProfiles-Settle-Logon' entry in the output is NOT
     # itself the bug: Register-Watchdog is a full desired-state reconciler
     # (see there), so -IncludeLogon:$false legitimately produces a
-    # reconcile-UNREGISTER result entry for Logon too. The bug this guards
-    # against is that entry being a REGISTRATION attempt instead (i.e.
-    # -IncludeLogon binding to its declared-true default in the child) --
-    # distinguished here by message shape: a real Register attempt on this
-    # cmdlet-less Linux host fails with a "term not recognized" message,
-    # while the reconcile-unregister no-ops successfully with a fixed
-    # message text.
+    # reconcile-UNREGISTER result entry for Logon too. The actual field bug
+    # this guards against was TWO-FOLD, both now fixed in
+    # ConvertTo-ElevatedArgumentString/the -IncludeLogon declarations: (1) an
+    # explicit "-IncludeLogon:$false" token failed to bind AT ALL across
+    # this real -File process boundary ("Cannot convert value
+    # "System.String" to type SwitchParameter", since -File args are literal
+    # unevaluated strings), which is why the serializer now omits a
+    # false/absent switch entirely instead of rendering an explicit value
+    # token; and (2), had that omission alone been the whole fix without
+    # also changing -IncludeLogon's own declared default away from $true, an
+    # omitted -IncludeLogon would have silently bound to that stale $true
+    # default in the child -- a REGISTRATION attempt instead of the
+    # reconcile-unregister this test expects. Distinguished here by message
+    # shape: a real Register attempt on this cmdlet-less Linux host fails
+    # with a "term not recognized" message, while the reconcile-unregister
+    # no-ops successfully with a fixed message text.
     if (-not (Get-Command -Name 'Start-Process' -ErrorAction SilentlyContinue)) {
         return
     }
@@ -1017,13 +1059,20 @@ Invoke-Scenario -Name 'GUI: Invoke-GuiElevationRetry skips the confirm/elevate d
     }
 } | Out-Null
 
-Invoke-Scenario -Name 'Resolvers: Get-ResolvedUserId falls back to DOMAIN\User when USERDOMAIN/USERNAME are set and no SID is available (non-Windows)' -Body {
-    # WindowsIdentity is unavailable on this (Linux) test host, so
-    # Get-ResolvedUserId falls through to its next-best signal. This is
-    # exactly the ambiguity the SID preference exists to avoid on real
-    # Windows: a bare name is ambiguous on a domain-joined machine, so
-    # "DOMAIN\User" must be preferred over a bare name whenever both
-    # environment variables are actually available.
+Invoke-Scenario -Name 'Resolvers: Get-ResolvedUserId falls back to DOMAIN\User when USERDOMAIN/USERNAME are set and no SID is available' -Body {
+    # Get-CurrentWindowsUserSid is shimmed (above) to always return $null,
+    # forcing Get-ResolvedUserId through to its next-best signal on EVERY
+    # platform this runs on -- including real Windows, where a SID is
+    # otherwise always genuinely available and this fallback branch could
+    # never be reached at all without the shim (the previous, unshimmed
+    # version of this test relied on WindowsIdentity simply being
+    # unavailable under pwsh on Linux, which made it pass here but fail on
+    # real Windows CI, where a SID IS available and the function correctly
+    # returns it instead of this fallback). This is exactly the ambiguity
+    # the SID preference exists to avoid on real Windows: a bare name is
+    # ambiguous on a domain-joined machine, so "DOMAIN\User" must be
+    # preferred over a bare name whenever both environment variables are
+    # actually available.
     $savedDomain = $env:USERDOMAIN
     $savedName = $env:USERNAME
     try {

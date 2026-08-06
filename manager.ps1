@@ -61,16 +61,31 @@
     Find-HostConf is used to guess it.
 
 .PARAMETER IncludeLogon
-    register-watchdog only: also register the logon/unlock task. On by
-    default. Registering it is the operation that can prompt Windows for
+    register-watchdog only: also register the logon/unlock task. Declared
+    here as a plain switch (default $false) -- NOT because omitting it
+    means "skip Logon" for a headless caller, but because this parameter
+    crosses the elevation boundary (Invoke-Elevated relaunches this exact
+    script via powershell.exe/pwsh -File) and -File cannot bind an explicit
+    -IncludeLogon:$false/-IncludeLogon:$true token to a switch parameter --
+    the literal "$false"/"$true" text arrives unevaluated and fails to
+    convert to SwitchParameter. See ConvertTo-ElevatedArgumentString: every
+    switch that crosses that boundary is rendered as a bare -Name for true
+    or omitted entirely for false, which only round-trips correctly when
+    the RECEIVING declared default is $false. Invoke-ManagerAction restores
+    the "omitted means Logon included" headless/CLI ergonomic for its own
+    direct (non-elevated-re-entry) callers via
+    $PSBoundParameters.ContainsKey('IncludeLogon') -- see there. Registering
+    the Logon task is the operation that can prompt Windows for
     administrator approval (logon-type scheduled-task triggers require
-    elevation to REGISTER even when the task's own principal is the
-    calling user) -- pass -IncludeLogon:$false to skip attempting that
-    registration. register-watchdog is a full desired-state reconciler,
-    though: passing -IncludeLogon:$false also REMOVES an already-registered
-    Logon task in the same call, so a poll-only call is not guaranteed to
-    be prompt-free if that removal is itself denied (e.g. the Logon task
-    was registered admin-owned by an earlier elevated retry).
+    elevation to REGISTER even when the task's own principal is the calling
+    user) -- pass -IncludeLogon (bare, i.e. present-but-unset-value is not
+    representable via -File; simply typing the flag means true) or omit it
+    entirely to mean false. register-watchdog is a full desired-state
+    reconciler, though: omitting -IncludeLogon also REMOVES an
+    already-registered Logon task in the same call, so a poll-only call is
+    not guaranteed to be prompt-free if that removal is itself denied (e.g.
+    the Logon task was registered admin-owned by an earlier elevated
+    retry).
 
 .PARAMETER IncludePoll
     register-watchdog only: also register the periodic poll task (off by
@@ -151,7 +166,13 @@ param(
     [string]$DataDir,
     [string]$ConfPath,
 
-    [switch]$IncludeLogon = $true,
+    # Plain switch (default $false), deliberately NOT "= $true" -- see the
+    # .PARAMETER IncludeLogon comment above: this parameter crosses the
+    # elevation boundary (-File), where a switch's declared default is what
+    # an omitted flag actually binds to. Invoke-ManagerAction is what
+    # restores "no explicit -IncludeLogon still means Logon included" for
+    # plain (non-elevated-re-entry) headless/CLI callers.
+    [switch]$IncludeLogon,
     [switch]$IncludePoll,
     [int]$PollMinutes = 15,
 
@@ -310,6 +331,31 @@ function Get-ResolvedConfPath {
     return Find-HostConf
 }
 
+function Get-CurrentWindowsUserSid {
+    # Isolated wrapper around WindowsIdentity.GetCurrent() -- kept as its
+    # own tiny function, exactly like the ScheduledTasks/Start-Process
+    # wrappers elsewhere in this file, so a test harness running under pwsh
+    # on Linux (where a SID is never available anyway) can ALSO redefine
+    # this one to deterministically force the "no SID available" branch of
+    # Get-ResolvedUserId on a real Windows CI runner -- where a SID is
+    # always genuinely available and the natural (non-shimmed) code path
+    # can therefore never exercise that branch at all. Returns $null/empty
+    # on any failure (not on Windows, or WindowsIdentity unavailable here);
+    # never throws.
+    try {
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        if (-not [string]::IsNullOrWhiteSpace($sid)) {
+            return $sid
+        }
+    }
+    catch {
+        # Not on Windows, or WindowsIdentity unavailable here -- fall
+        # through to returning $null below, exactly as if no SID were
+        # available.
+    }
+    return $null
+}
+
 function Get-ResolvedUserId {
     # The only place the CALLING process's own identity is read for
     # watchdog-principal purposes (see the architecture note on
@@ -334,16 +380,9 @@ function Get-ResolvedUserId {
     if (-not [string]::IsNullOrWhiteSpace($UserId)) {
         return $UserId
     }
-    try {
-        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        if (-not [string]::IsNullOrWhiteSpace($sid)) {
-            return $sid
-        }
-    }
-    catch {
-        # Not on Windows, or WindowsIdentity unavailable here (e.g. this
-        # test harness running under pwsh on Linux) -- fall through to the
-        # name-based resolvers below.
+    $sid = Get-CurrentWindowsUserSid
+    if (-not [string]::IsNullOrWhiteSpace($sid)) {
+        return $sid
     }
     if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN) -and -not [string]::IsNullOrWhiteSpace($env:USERNAME)) {
         return "$env:USERDOMAIN\$env:USERNAME"
@@ -2031,24 +2070,50 @@ function ConvertTo-ElevatedArgumentString {
     foreach ($key in $Parameters.Keys) {
         $value = $Parameters[$key]
         if ($value -is [switch]) {
-            # Always render an explicit -Name:$true / -Name:$false token,
-            # never a bare -Name for true and silent omission for false.
-            # Omitting an absent switch used to be "safe" only by accident:
-            # it relies on the CALLED script's own declared default for
-            # that parameter, which is $false for most switches but is
-            # $true for -IncludeLogon (default ON). An omitted
-            # -IncludeLogon:$false therefore bound to $true in the elevated
-            # child -- the exact opposite of what the caller passed -- and
-            # silently re-registered the Logon task the user had just
-            # declined. powershell.exe -File parses "-Name:$true"/
-            # "-Name:$false" as literal switch-value tokens (no quoting
-            # needed: no space, and this string never passes through a
-            # shell that would interpret the leading '$'), so there is no
-            # tradeoff versus the bare-flag form for staying correct.
-            $argParts.Add('-' + $key + ':' + $(if ($value.IsPresent) { '$true' } else { '$false' }))
+            # Render a BARE -Name token for true, and OMIT the parameter
+            # entirely for false -- never an explicit -Name:$true/-Name:
+            # $false token. This used to render the explicit :$true/:$false
+            # form on the theory that a bare-flag-for-true/omit-for-false
+            # scheme was only "safe" by accident (relying on the CALLED
+            # script's own declared default). That theory was correct as
+            # far as it went, but the explicit-token form has a worse,
+            # unconditional problem: powershell.exe/pwsh invoked with -File
+            # (exactly how Invoke-Elevated always re-launches this script)
+            # parses script arguments as LITERAL, unevaluated strings -- the
+            # four/five characters "$true"/"$false" arrive as a bare
+            # [string], and PowerShell's own parameter binder cannot convert
+            # a [string] to [SwitchParameter], so EVERY explicit -Name:
+            # $true/-Name:$false token fails elevation outright with
+            # "Cannot process argument transformation ... Cannot convert
+            # value "System.String" to type SwitchParameter" (the actual
+            # field failure this guards against). A bare -Name (no colon,
+            # no value) is exactly how a switch is normally supplied on any
+            # command line and always binds to $true; omitting the
+            # parameter always binds to whatever the RECEIVING script
+            # declared as that switch's own default. For this scheme to be
+            # sound, every switch that can cross this boundary MUST declare
+            # a $false default at the receiving end (see -IncludeLogon's own
+            # comment for the one parameter that used to violate this and
+            # how its "omitted still means on" ergonomic is now restored
+            # one layer up, in Invoke-ManagerAction, instead of by lying
+            # about its own default).
+            if ($value.IsPresent) {
+                $argParts.Add('-' + $key)
+            }
         }
         elseif ($value -is [bool]) {
-            $argParts.Add('-' + $key + ':' + $(if ($value) { '$true' } else { '$false' }))
+            # Same -File string-literal hazard as [switch] above applies to
+            # any [bool]-typed parameter that might cross this boundary --
+            # there is no such parameter today (audited: every boundary
+            # parameter is [switch], [string], or [int]), but if one is ever
+            # added it must not silently regress to the broken :$true/
+            # :$false form either. Bare-for-true/omit-for-false only works
+            # here if the receiving parameter is also declared to default to
+            # $false; there is deliberately no fallback branch that renders
+            # an explicit boolean token.
+            if ($value) {
+                $argParts.Add('-' + $key)
+            }
         }
         else {
             $argParts.Add('-' + $key)
@@ -2109,13 +2174,32 @@ function Invoke-ManagerAction {
     # Dispatches one headless -Action, resolving unset path parameters via
     # the Get-Resolved*/Get-Default* helpers above before calling into the
     # relevant Core function(s).
+    #
+    # -IncludeLogon is a plain switch (default $false), not "= $true", for
+    # the same -File/elevation-boundary reason as the top-level script
+    # parameter of the same name (see its own comment) -- this function is
+    # called both by that top-level script's CLI dispatch (which always
+    # forwards its own -IncludeLogon value EXPLICITLY, whatever it resolved
+    # to, including an elevated re-entry's deliberate $false) and directly,
+    # in-process, by callers (tests, any future headless wrapper) that may
+    # not think to pass -IncludeLogon at all. Those two cases must be told
+    # apart, which is exactly what $PSBoundParameters.ContainsKey below
+    # does in the 'register-watchdog' case: bound (whatever value, since an
+    # elevated re-entry's forwarded value is always bound) -> honor it
+    # as-is; NOT bound (a direct caller that omitted it entirely) -> restore
+    # the long-standing "register-watchdog with no explicit -IncludeLogon
+    # still means Logon included" headless ergonomic. This must NOT be
+    # "solved" by giving this parameter a $true default again -- that is
+    # exactly what silently re-registered a declined Logon task in the
+    # original field bug, because it collapses the "caller deliberately
+    # said false" and "caller said nothing" cases back into one.
     param(
         [Parameter(Mandatory = $true)][string]$Action,
         [Parameter(Mandatory = $true)][string]$ScriptDir,
         [string]$ProgramDir,
         [string]$DataDir,
         [string]$ConfPath,
-        [switch]$IncludeLogon = $true,
+        [switch]$IncludeLogon,
         [switch]$IncludePoll,
         [int]$PollMinutes = 15,
         [switch]$RemoveData,
@@ -2193,7 +2277,18 @@ function Invoke-ManagerAction {
             return $removeResult
         }
         'register-watchdog' {
-            return Register-Watchdog -DataDir $resolvedDataDir -UserId $resolvedUserId -IncludeLogon:$IncludeLogon -IncludePoll:$IncludePoll -PollMinutes $PollMinutes
+            # See this function's own header comment: an explicitly bound
+            # -IncludeLogon (including an elevated re-entry's deliberate
+            # $false, always forwarded bound by the top-level CLI dispatch)
+            # is honored as-is; a caller that omitted it entirely gets the
+            # long-standing "Logon included by default" ergonomic restored
+            # here, exactly once, rather than via this parameter's own
+            # declared default.
+            $effectiveIncludeLogon = $IncludeLogon
+            if (-not $PSBoundParameters.ContainsKey('IncludeLogon')) {
+                $effectiveIncludeLogon = $true
+            }
+            return Register-Watchdog -DataDir $resolvedDataDir -UserId $resolvedUserId -IncludeLogon:$effectiveIncludeLogon -IncludePoll:$IncludePoll -PollMinutes $PollMinutes
         }
         'unregister-watchdog' {
             return Unregister-Watchdog
@@ -3892,6 +3987,20 @@ if (-not $NoRun) {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($Action)) {
+        # -IncludeLogon:$IncludeLogon is passed through EXPLICITLY and
+        # unconditionally here, on purpose, whatever it resolved to
+        # (bare -IncludeLogon on this process's own command line -> $true;
+        # omitted -> $false, this parameter's own plain-switch default --
+        # see its declaration above). That is what makes an elevated
+        # re-entry's deliberate "false" (rendered by ConvertTo-
+        # ElevatedArgumentString as an omitted flag, then bound to $false
+        # right here by this exact same declared default) survive
+        # unchanged into Invoke-ManagerAction as an explicitly BOUND $false
+        # -- which is what lets Invoke-ManagerAction tell "caller said
+        # false" apart from "caller said nothing" via its own
+        # $PSBoundParameters check (see there) and restore the
+        # omitted-means-Logon-included ergonomic ONLY for callers that
+        # truly never mentioned -IncludeLogon at all, not for this one.
         $result = Invoke-ManagerAction -Action $Action -ScriptDir $scriptDirForRun -ProgramDir $ProgramDir -DataDir $DataDir -ConfPath $ConfPath -IncludeLogon:$IncludeLogon -IncludePoll:$IncludePoll -PollMinutes $PollMinutes -RemoveData:$RemoveData -ManagerScriptPath $ManagerScriptPath -CommandPath $PSCommandPath -UserId $UserId -DesktopDir $DesktopDir -ProgramsDir $ProgramsDir -AddStartMenuShortcut:$AddStartMenuShortcut -AddDesktopShortcut:$AddDesktopShortcut
         $result | ConvertTo-Json -Depth 6
         # A Core function can signal failure by RETURNING Success=$false
