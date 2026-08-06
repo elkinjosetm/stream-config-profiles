@@ -180,6 +180,13 @@ jobs:
           Get-Content -LiteralPath $sumsPath | Write-Host
 
       - name: Attest build provenance for dist artifacts
+        # actions/attest-build-provenance errors out with "Feature not
+        # available for user-owned private repositories" on a private repo
+        # owned by a user (as opposed to an org on GHEC) -- GitHub only
+        # supports attestations there or on public repos. Skip the step in
+        # that case rather than failing the whole release; it self-activates
+        # automatically the moment this repository is made public.
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           # SHA256SUMS.txt included alongside the binaries it hashes --
