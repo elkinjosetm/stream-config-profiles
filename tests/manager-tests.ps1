@@ -2425,8 +2425,9 @@ Invoke-Scenario -Name 'DPI awareness: Initialize-GuiAssemblies calls Enable-GuiD
     $body = [regex]::Match($source, '(?s)function Initialize-GuiAssemblies \{.*?\n\}\r?\n')
     Assert-That $body.Success 'sanity: should be able to locate Initialize-GuiAssemblies''s body'
 
-    $callIndex = $body.Value.IndexOf("`n    Enable-GuiDpiAwareness`n")
-    Assert-That ($callIndex -ge 0) 'Initialize-GuiAssemblies should call Enable-GuiDpiAwareness as its own statement'
+    $callMatch = [regex]::Match($body.Value, '\r?\n {4}Enable-GuiDpiAwareness\r?\n')
+    Assert-That $callMatch.Success 'Initialize-GuiAssemblies should call Enable-GuiDpiAwareness as its own statement'
+    $callIndex = $callMatch.Index
 
     $addTypeFormsIndex = $body.Value.IndexOf('Add-Type -AssemblyName System.Windows.Forms')
     Assert-That ($addTypeFormsIndex -ge 0) 'sanity: should be able to locate the System.Windows.Forms Add-Type call'
