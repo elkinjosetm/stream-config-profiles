@@ -2356,6 +2356,126 @@ Invoke-Scenario -Name 'Show-WizardDoneStep: the Finish handler binds New-Manager
 } | Out-Null
 
 # ===========================================================================
+# High-DPI GUI fix -- field feedback: an unaware process gets bitmap-
+# stretched by Windows on a high-DPI/4K display, so its text looks blurry.
+# Every scenario below is source-level (regex over the raw script text),
+# same as the other GUI: scenarios above -- actual crisp-vs-blurry
+# rendering can only be confirmed by eye on a real high-DPI Windows
+# display, which this headless Linux harness cannot do.
+# ===========================================================================
+
+Invoke-Scenario -Name 'DPI awareness: Enable-GuiDpiAwareness is defined and is idempotent (guarded by a script-scope flag)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    Assert-That ($source -match '(?m)^function Enable-GuiDpiAwareness\s*\{') 'manager.ps1 should define Enable-GuiDpiAwareness'
+
+    $body = [regex]::Match($source, '(?s)function Enable-GuiDpiAwareness \{.*?\n\}\r?\n\r?\nfunction Initialize-GuiAssemblies')
+    Assert-That $body.Success 'sanity: should be able to locate Enable-GuiDpiAwareness''s body'
+    Assert-That ($body.Value -match [regex]::Escape('if ($script:GuiDpiAwarenessEnabled)') + '\s*\{\s*return') 'Enable-GuiDpiAwareness should return immediately (a no-op) if already applied'
+    Assert-That ($body.Value -match [regex]::Escape('$script:GuiDpiAwarenessEnabled = $true')) 'Enable-GuiDpiAwareness should set its own guard flag before doing any P/Invoke work'
+} | Out-Null
+
+Invoke-Scenario -Name 'DPI awareness: Enable-GuiDpiAwareness never runs off-Windows' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Enable-GuiDpiAwareness \{.*?\n\}\r?\n\r?\nfunction Initialize-GuiAssemblies')
+    Assert-That $body.Success 'sanity: should be able to locate Enable-GuiDpiAwareness''s body'
+
+    # Same Windows-host check Test-IsAdmin already uses elsewhere in this
+    # file -- Desktop edition (always Windows) or pwsh's own $IsWindows.
+    Assert-That ($body.Value -match [regex]::Escape("PSVersionTable.PSEdition -eq 'Desktop'")) 'should check PSEdition -eq Desktop (Windows PowerShell 5.1 is always Windows)'
+    Assert-That ($body.Value -match [regex]::Escape("Get-Variable -Name 'IsWindows'")) 'should check pwsh''s own $IsWindows (via Get-Variable, so it never throws when the variable does not exist)'
+    Assert-That ($body.Value -match '(?s)if\s*\(-not\s*\(\$isDesktopEdition\s*-or\s*\$isWindowsCore\)\)\s*\{\s*return') 'should return early (no P/Invoke attempted at all) on a non-Windows host -- this is what makes the function a safe no-op under this Linux test harness'
+} | Out-Null
+
+Invoke-Scenario -Name 'DPI awareness: the fallback chain declares all three documented Windows APIs, in order, each guarded by its own try/catch' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Enable-GuiDpiAwareness \{.*?\n\}\r?\n\r?\nfunction Initialize-GuiAssemblies')
+    Assert-That $body.Success 'sanity: should be able to locate Enable-GuiDpiAwareness''s body'
+
+    Assert-That ($body.Value -match 'SetProcessDpiAwarenessContext') 'should P/Invoke SetProcessDpiAwarenessContext (user32, Windows 10 1703+, per-monitor v2)'
+    Assert-That ($body.Value -match 'SetProcessDpiAwareness\b') 'should P/Invoke SetProcessDpiAwareness (shcore, Windows 8.1+, per-monitor v1)'
+    Assert-That ($body.Value -match 'SetProcessDPIAware\b') 'should P/Invoke the legacy SetProcessDPIAware (user32, any Windows)'
+
+    # Ordering: v2 context first, then the older shcore call, then the
+    # legacy call last -- best-to-worst, matching the CHANGES spec. Looked
+    # up as actual CALL sites ("::Name(...)"), not just any mention of the
+    # name -- the P/Invoke declarations above also name all three (in
+    # declaration order), which would otherwise make this assertion
+    # trivially true regardless of the real fallback-attempt order below.
+    $v2Index = $body.Value.IndexOf('::SetProcessDpiAwarenessContext(')
+    $v1Index = $body.Value.IndexOf('::SetProcessDpiAwareness(2)')
+    $legacyIndex = $body.Value.IndexOf('::SetProcessDPIAware()')
+    Assert-That ($v2Index -ge 0 -and $v1Index -gt $v2Index -and $legacyIndex -gt $v1Index) "expected a SetProcessDpiAwarenessContext call, then a SetProcessDpiAwareness(2) call, then a SetProcessDPIAware() call in that order, got indices $v2Index / $v1Index / $legacyIndex"
+
+    # Every native call site sits inside its own try/catch -- a crude but
+    # effective proxy: at least three 'try {' / 'catch {' pairs inside this
+    # function's body (Add-Type's own try/catch, plus one per fallback
+    # step).
+    $tryCount = @([regex]::Matches($body.Value, '(?m)^\s*try\s*\{')).Count
+    Assert-That ($tryCount -ge 4) "expected at least 4 try/catch blocks (Add-Type + 3 fallback APIs), found $tryCount"
+
+    # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is -4; PROCESS_PER_MONITOR_
+    # DPI_AWARE is 2 -- both spelled out in the CHANGES spec, so pin the
+    # literal values too, not just the API names.
+    Assert-That ($body.Value -match [regex]::Escape('[IntPtr]::new(-4)')) 'SetProcessDpiAwarenessContext should be called with DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (IntPtr -4)'
+    Assert-That ($body.Value -match 'SetProcessDpiAwareness\(2\)') 'SetProcessDpiAwareness should be called with PROCESS_PER_MONITOR_DPI_AWARE (2)'
+} | Out-Null
+
+Invoke-Scenario -Name 'DPI awareness: Initialize-GuiAssemblies calls Enable-GuiDpiAwareness first, before System.Windows.Forms is even loaded' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Initialize-GuiAssemblies \{.*?\n\}\r?\n')
+    Assert-That $body.Success 'sanity: should be able to locate Initialize-GuiAssemblies''s body'
+
+    $callIndex = $body.Value.IndexOf("`n    Enable-GuiDpiAwareness`n")
+    Assert-That ($callIndex -ge 0) 'Initialize-GuiAssemblies should call Enable-GuiDpiAwareness as its own statement'
+
+    $addTypeFormsIndex = $body.Value.IndexOf('Add-Type -AssemblyName System.Windows.Forms')
+    Assert-That ($addTypeFormsIndex -ge 0) 'sanity: should be able to locate the System.Windows.Forms Add-Type call'
+    Assert-That ($callIndex -lt $addTypeFormsIndex) 'Enable-GuiDpiAwareness must run before System.Windows.Forms is loaded -- and therefore before any window/control/handle can possibly exist'
+} | Out-Null
+
+Invoke-Scenario -Name 'DPI awareness: Initialize-GuiAssemblies enables visual styles then disables compatible text rendering, before any control can exist' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Initialize-GuiAssemblies \{.*?\n\}\r?\n')
+    Assert-That $body.Success 'sanity: should be able to locate Initialize-GuiAssemblies''s body'
+
+    $visualIndex = $body.Value.IndexOf('[System.Windows.Forms.Application]::EnableVisualStyles()')
+    $renderingIndex = $body.Value.IndexOf('[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)')
+    Assert-That ($visualIndex -ge 0) 'Initialize-GuiAssemblies should call EnableVisualStyles()'
+    Assert-That ($renderingIndex -ge 0) 'Initialize-GuiAssemblies should call SetCompatibleTextRenderingDefault($false)'
+    Assert-That ($visualIndex -lt $renderingIndex) 'SetCompatibleTextRenderingDefault must run after EnableVisualStyles (the documented Microsoft ordering) -- and, since it throws once any control has been created, this whole function must run before any Form/control does'
+} | Out-Null
+
+Invoke-Scenario -Name 'DPI awareness: Enable-GuiDpiAwareness (and the GUI bootstrap that calls it) is never reachable from the headless Invoke-ManagerAction dispatch' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Invoke-ManagerAction \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $body.Success 'sanity: should be able to locate Invoke-ManagerAction''s body'
+
+    Assert-That (-not ($body.Value -match 'Enable-GuiDpiAwareness')) 'Invoke-ManagerAction (the headless -Action dispatch) must never call Enable-GuiDpiAwareness -- DPI awareness is a GUI-bootstrap-only concern'
+    Assert-That (-not ($body.Value -match 'Initialize-GuiAssemblies')) 'Invoke-ManagerAction (the headless -Action dispatch) must never call Initialize-GuiAssemblies (which is what actually calls Enable-GuiDpiAwareness) either'
+} | Out-Null
+
+Invoke-Scenario -Name 'DPI awareness: New-GuiForm sets an explicit Segoe UI 9pt Font and AutoScaleMode=Font with a matching AutoScaleDimensions basis' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function New-GuiForm \{.*?\n\}\r?\n\r?\nfunction New-GuiLabel')
+    Assert-That $body.Success 'sanity: should be able to locate New-GuiForm''s body'
+
+    Assert-That ($body.Value -match [regex]::Escape("New-Object System.Drawing.Font('Segoe UI', 9)")) 'New-GuiForm should set an explicit Segoe UI, 9pt Font'
+    Assert-That ($body.Value -match [regex]::Escape('$form.Font =')) 'New-GuiForm should assign that Font onto the form (not just construct it)'
+    Assert-That ($body.Value -match '\$form\.AutoScaleMode\s*=\s*\[System\.Windows\.Forms\.AutoScaleMode\]::Font') 'New-GuiForm should set AutoScaleMode = Font so the pixel-designed layouts scale with the font at 150%/200%'
+    Assert-That ($body.Value -match [regex]::Escape('$form.AutoScaleDimensions = New-Object System.Drawing.SizeF(7, 15)')) 'New-GuiForm should set AutoScaleDimensions to the design-time basis matching Segoe UI 9pt, so scaling is relative to the actual designed font rather than some other default'
+} | Out-Null
+
+Invoke-Scenario -Name 'DPI awareness: every Form the app creates goes through New-GuiForm, not a bare New-Object System.Windows.Forms.Form' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+
+    $bareFormSites = @([regex]::Matches($source, 'New-Object System\.Windows\.Forms\.Form\b'))
+    Assert-That (@($bareFormSites).Count -eq 1) "expected exactly one bare 'New-Object System.Windows.Forms.Form' left in the file (inside New-GuiForm itself), found $(@($bareFormSites).Count) -- every other Form-creation site should call New-GuiForm instead so DPI/font scaling is never forgotten on a new one"
+
+    $formFactorySites = @([regex]::Matches($source, '\$form\s*=\s*New-GuiForm\b'))
+    Assert-That (@($formFactorySites).Count -ge 7) "expected at least 7 '`$form = New-GuiForm' call sites (5 wizard steps + the Connect dialog + the Main Window), found $(@($formFactorySites).Count)"
+} | Out-Null
+
+# ===========================================================================
 # Report + cleanup
 # ===========================================================================
 
