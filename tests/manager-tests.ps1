@@ -943,13 +943,33 @@ Invoke-Scenario -Name 'Elevation (end-to-end): a poll-only elevation retry, run 
     $stdoutText = Read-TextFile $stdout
     Assert-That (-not [string]::IsNullOrWhiteSpace($stdoutText)) "the child process should have printed its JSON result (stderr was: $(Read-TextFile $stderr))"
 
+    # $_.Name/$_.Message below are cast to [string] explicitly, and every
+    # filtered set is re-wrapped in @(...) before .Count, rather than
+    # comparing/indexing the raw ConvertFrom-Json output directly. This is
+    # the one assertion in the whole suite that inspects an object which
+    # crossed a REAL JSON serialize/deserialize boundary (every other
+    # entries[0]/results[0]-style assertion elsewhere in this file inspects
+    # a live in-process object). ConvertFrom-Json's shape (bare
+    # PSCustomObject vs Object[]) for a given payload can differ between
+    # Windows PowerShell 5.1 and pwsh 7, and a property fetched off an
+    # array-shaped element enumerates across every element instead of
+    # returning one scalar -- so an unguarded "$x.Name -eq ..." or
+    # "$x.Message -eq ..." can silently evaluate to a filtered ARRAY (0 or
+    # 2+ elements) instead of a plain scalar bool. Assert-That's own
+    # [bool]$Condition parameter binder cannot convert a multi/zero-element
+    # array ("Cannot convert value "System.Object[]" to type
+    # "System.Boolean""), so that shape mismatch crashes the scenario
+    # outright instead of failing a plain assertion. Casting to [string]
+    # first costs nothing when the value is already the plain string it is
+    # supposed to be, and guarantees a scalar either way.
     $parsed = @($stdoutText | ConvertFrom-Json)
-    $pollEntries = @($parsed | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Poll' })
-    Assert-That ($pollEntries.Count -eq 1) "expected exactly one Poll result entry across the real process boundary, got names: $((@($parsed | ForEach-Object { $_.Name })) -join ', ')"
+    $pollEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Poll' })
+    Assert-That (@($pollEntries).Count -eq 1) "expected exactly one Poll result entry across the real process boundary, got names: $((@($parsed | ForEach-Object { [string]$_.Name })) -join ', ')"
 
-    $logonEntries = @($parsed | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Logon' })
-    if ($logonEntries.Count -gt 0) {
-        Assert-That ($logonEntries[0].Message -eq 'unregistered (not requested)') "the field bug: a caller-declined -IncludeLogon:`$false must never reach a REGISTRATION attempt in the elevated child (it bound to its declared-true default instead, silently re-registering a task the user had just declined) -- got Logon result: Success=$($logonEntries[0].Success), Message='$($logonEntries[0].Message)'"
+    $logonEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Logon' })
+    if (@($logonEntries).Count -gt 0) {
+        $logonMessage = [string]$logonEntries[0].Message
+        Assert-That ($logonMessage -eq 'unregistered (not requested)') "the field bug: a caller-declined -IncludeLogon:`$false must never reach a REGISTRATION attempt in the elevated child (it bound to its declared-true default instead, silently re-registering a task the user had just declined) -- got Logon result: Success=$($logonEntries[0].Success), Message='$logonMessage'"
     }
 } | Out-Null
 
