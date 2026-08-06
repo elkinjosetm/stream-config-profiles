@@ -2499,13 +2499,121 @@ function Get-ManagerResultFailureMessage {
 # WinForms bootstrap
 # ---------------------------------------------------------------------------
 
+# Guards Enable-GuiDpiAwareness so it only ever declares/P-Invokes once per
+# process -- Initialize-GuiAssemblies is only called once per real GUI
+# launch anyway (see Show-ManagerGui), but the guard also means a second,
+# accidental call (e.g. from a future code path, or a test exercising the
+# function directly) never re-runs Add-Type against an already-defined
+# type.
+$script:GuiDpiAwarenessEnabled = $false
+
+function Enable-GuiDpiAwareness {
+    # Declares this process per-monitor-DPI-aware BEFORE Initialize-
+    # GuiAssemblies below loads System.Windows.Forms or creates any
+    # window/control -- Windows latches a process's DPI awareness the
+    # first time it is ever consulted, so this must run first or not at
+    # all. Without it, Windows treats the process as DPI-unaware and
+    # bitmap-stretches its whole UI to fill a high-DPI/4K display (the
+    # field-reported "blurry text"), scaling a 96-DPI-rendered bitmap up
+    # instead of asking this process to render at the monitor's real DPI.
+    #
+    # GUI-only, by construction: only Show-ManagerGui's path (via
+    # Initialize-GuiAssemblies) ever calls this -- never Invoke-
+    # ManagerAction / the headless -Action dispatch, which has no window
+    # to protect and must stay usable on a non-Windows CI/test host.
+    #
+    # Fallback chain, oldest API last, each attempt independently
+    # try/caught so a missing DLL export (older Windows), a denied
+    # P/Invoke, or Add-Type itself failing (no C# compiler available) can
+    # never do worse than today's behavior -- it just leaves the process
+    # DPI-unaware, i.e. exactly as blurry as before this function existed,
+    # never a crash of the GUI:
+    #   a) SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    #      -- user32.dll, Windows 10 1703+, best (per-monitor v2).
+    #   b) SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+    #      -- shcore.dll, Windows 8.1+, per-monitor v1.
+    #   c) SetProcessDPIAware() -- user32.dll, any Windows, system-DPI-only
+    #      but still sharper than doing nothing.
+    if ($script:GuiDpiAwarenessEnabled) {
+        return
+    }
+    $script:GuiDpiAwarenessEnabled = $true
+
+    # Same Windows-host check Test-IsAdmin uses -- Windows PowerShell 5.1
+    # is always Desktop edition (always Windows); pwsh 7's $IsWindows is
+    # the only other signal, and is what makes this a no-op on the
+    # headless Linux test host this repo's own tests dot-source the file
+    # under.
+    $isDesktopEdition = ($PSVersionTable.PSEdition -eq 'Desktop')
+    $isWindowsCore = [bool](Get-Variable -Name 'IsWindows' -ErrorAction SilentlyContinue -ValueOnly)
+    if (-not ($isDesktopEdition -or $isWindowsCore)) {
+        return
+    }
+
+    try {
+        Add-Type -ErrorAction Stop -Namespace ManagerDpiNative -Name NativeMethods -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiAwarenessContext);
+
+[System.Runtime.InteropServices.DllImport("shcore.dll", SetLastError = true)]
+public static extern int SetProcessDpiAwareness(int value);
+
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool SetProcessDPIAware();
+'@
+    }
+    catch {
+        # No C# compiler / Add-Type unavailable -- nothing left to try.
+        return
+    }
+
+    try {
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4.
+        if ([ManagerDpiNative.NativeMethods]::SetProcessDpiAwarenessContext([IntPtr]::new(-4))) {
+            return
+        }
+    }
+    catch {
+        # Entry point missing (pre-1703) or otherwise refused -- fall
+        # through to the next, older API.
+    }
+
+    try {
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2. Returns an HRESULT; S_OK = 0.
+        if ([ManagerDpiNative.NativeMethods]::SetProcessDpiAwareness(2) -eq 0) {
+            return
+        }
+    }
+    catch {
+        # Entry point missing (pre-8.1) or otherwise refused -- fall
+        # through to the legacy, system-DPI-only API.
+    }
+
+    try {
+        [void][ManagerDpiNative.NativeMethods]::SetProcessDPIAware()
+    }
+    catch {
+        # Every fallback failed -- leave the process DPI-unaware, exactly
+        # today's behavior.
+    }
+}
+
 function Initialize-GuiAssemblies {
     # Loaded lazily (only when a GUI is actually about to be shown) so that
     # dot-sourcing this file with -NoRun on a headless Linux test host --
     # or running a headless -Action on Windows -- never touches WinForms.
+    #
+    # Order matters: Enable-GuiDpiAwareness must run before System.Windows.
+    # Forms is even loaded (before any window/control/handle can possibly
+    # exist -- see its own comment), and SetCompatibleTextRenderingDefault
+    # must run before any control is created (it throws
+    # InvalidOperationException once one has) but after EnableVisualStyles
+    # -- the documented Microsoft ordering.
+    Enable-GuiDpiAwareness
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
+    [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 }
 
 function Test-GuiIsStaThread {
@@ -2855,6 +2963,29 @@ function Invoke-VibepolloConnectAction {
 # the given coordinates; callers add behaviour (event handlers) themselves.
 # ---------------------------------------------------------------------------
 
+function New-GuiForm {
+    # Every Form this app shows (wizard steps, main window, connect dialog)
+    # is created through here, never via a bare `New-Object
+    # System.Windows.Forms.Form` -- so DPI/font scaling stays consistent
+    # everywhere at once, not per-form-and-hope. An explicit Font (rather
+    # than inheriting whichever default GDI font the host happens to pick)
+    # plus AutoScaleMode = Font with AutoScaleDimensions set to that exact
+    # font's own design-time metrics (7x15, the standard basis for Segoe
+    # UI 9pt -- see e.g. any modern Visual-Studio-generated WinForms
+    # designer file) means every step/window below's pixel-coordinate
+    # Location/Size values (set via New-GuiLabel/New-GuiButton/... -X/-Y
+    # /-Width/-Height, all designed against that same 7x15 basis) scale
+    # together with the font at 150%/200% instead of the text growing
+    # (Enable-GuiDpiAwareness's per-monitor DPI awareness) while the fixed
+    # pixel layout around it does not -- which would clip or overlap
+    # controls instead of just looking crisp.
+    $form = New-Object System.Windows.Forms.Form
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
+    $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(7, 15)
+    return $form
+}
+
 function New-GuiLabel {
     param([string]$Text, [int]$X, [int]$Y, [int]$Width, [int]$Height = 20)
     $lbl = New-Object System.Windows.Forms.Label
@@ -3028,7 +3159,7 @@ function Get-WatchdogTaskExistence {
 function Show-WizardWelcomeStep {
     param([hashtable]$State)
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-GuiForm
     $form.Text = 'stream-config-profiles - Setup (1 of 5): Welcome'
     $form.Size = New-Object System.Drawing.Size(520, 300)
     $form.StartPosition = 'CenterScreen'
@@ -3083,7 +3214,7 @@ function Show-WizardWelcomeStep {
 function Show-WizardInstallStep {
     param([hashtable]$State)
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-GuiForm
     $form.Text = 'stream-config-profiles - Setup (2 of 5): Install files'
     $form.Size = New-Object System.Drawing.Size(520, 300)
     $form.StartPosition = 'CenterScreen'
@@ -3158,7 +3289,7 @@ function Show-WizardInstallStep {
 function Show-WizardVibepolloStep {
     param([hashtable]$State)
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-GuiForm
     $form.Text = 'stream-config-profiles - Setup (3 of 5): Connect to Vibepollo/Apollo'
     $form.Size = New-Object System.Drawing.Size(560, 340)
     $form.StartPosition = 'CenterScreen'
@@ -3314,7 +3445,7 @@ function Show-WizardVibepolloStep {
 function Show-WizardWatchdogStep {
     param([hashtable]$State)
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-GuiForm
     $form.Text = 'stream-config-profiles - Setup (4 of 5): Watchdog protection'
     $form.Size = New-Object System.Drawing.Size(520, 300)
     $form.StartPosition = 'CenterScreen'
@@ -3426,7 +3557,7 @@ function Show-WizardWatchdogStep {
 function Show-WizardDoneStep {
     param([hashtable]$State)
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-GuiForm
     $form.Text = 'stream-config-profiles - Setup (5 of 5): Done'
     $form.Size = New-Object System.Drawing.Size(520, 350)
     $form.StartPosition = 'CenterScreen'
@@ -3558,7 +3689,7 @@ function Show-VibepolloConnectDialog {
         [Parameter(Mandatory = $true)][string]$DataDir
     )
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-GuiForm
     $form.Text = 'stream-config-profiles - Connect to Vibepollo/Apollo'
     $form.Size = New-Object System.Drawing.Size(560, 300)
     $form.StartPosition = 'CenterScreen'
@@ -3695,7 +3826,7 @@ function Show-MainWindow {
     # this reason.
     $vibepolloConnection = [PSCustomObject]@{ ConfPath = $ConfPath }
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-GuiForm
     $form.Text = 'stream-config-profiles'
     $form.Size = New-Object System.Drawing.Size(640, 660)
     $form.StartPosition = 'CenterScreen'
