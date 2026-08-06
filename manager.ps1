@@ -523,6 +523,18 @@ function Install-App {
     $managerDest = Join-Path $ProgramDir 'manager.ps1'
     [System.IO.File]::WriteAllText($managerDest, $managerContent, $script:Utf8NoBomEncoding)
 
+    # launch.vbs is always (re)written, exactly like manager.ps1 itself --
+    # it is the shortcut's actual target (see Get-ManagerShortcutDefinition
+    # / Get-ManagerLaunchVbsContent for why a windowless wscript.exe
+    # indirection is used instead of pointing the .lnk at powershell.exe
+    # directly), so an upgrade from a pre-launch.vbs install must gain one,
+    # and any install must have its content stay in sync with the CURRENT
+    # ProgramDir (a reinstall to a different path would otherwise leave a
+    # stale launch.vbs pointing at the old manager.ps1 location).
+    $launchVbsContent = Get-ManagerLaunchVbsContent -ProgramDir $ProgramDir
+    $launchVbsDest = Get-ManagerLaunchVbsPath -ProgramDir $ProgramDir
+    [System.IO.File]::WriteAllText($launchVbsDest, $launchVbsContent, $script:Utf8NoBomEncoding)
+
     return [PSCustomObject]@{
         ProgramDir  = $ProgramDir
         DataDir     = $DataDir
@@ -530,6 +542,7 @@ function Install-App {
         TemplatePath = $templateDest
         PathsTxtPath = $pathsTxt
         ManagerPath = $managerDest
+        LaunchVbsPath = $launchVbsDest
     }
 }
 
@@ -550,26 +563,90 @@ function Install-App {
 # that tests can exercise directly against a sandboxed path.
 # ---------------------------------------------------------------------------
 
-function Get-ManagerShortcutDefinition {
-    # The target/arguments/working-directory a "Stream Config Profiles"
-    # shortcut should carry, given PROGRAM (the folder Install-App copies
-    # manager.ps1 into). Always launches via the real Windows PowerShell
-    # 5.1 executable -- see Get-WindowsPowerShellExePath's own comment on
-    # why never a bare "powershell.exe" -- with -NoProfile
-    # -ExecutionPolicy Bypass -File "<PROGRAM>\manager.ps1", the no-arg GUI
-    # entry point.
+function Get-ManagerLaunchVbsPath {
+    # The one well-known path of the tiny launcher script Install-App
+    # writes into PROGRAM alongside manager.ps1 -- see
+    # Get-ManagerLaunchVbsContent for what it contains and why it exists.
+    # Pulled out into its own one-line resolver (rather than inlining
+    # Join-Path at each of the three call sites -- Install-App, the
+    # shortcut definition, and any future uninstall/test code) so the
+    # filename is spelled in exactly one place.
+    param([Parameter(Mandatory = $true)][string]$ProgramDir)
+    return Join-Path $ProgramDir 'launch.vbs'
+}
+
+function Get-ManagerLaunchVbsContent {
+    # Body of launch.vbs: a two-line Windows Script Host script whose sole
+    # job is `objShell.Run <manager.ps1 command line>, 0, False` -- window
+    # style 0 (SW_HIDE) and no wait. This indirection exists because a
+    # shortcut that launches powershell.exe DIRECTLY (even with its own
+    # -WindowStyle Hidden argument, and even with the .lnk's own
+    # WindowStyle set to minimized) still shows a visible console window
+    # on Windows 11 machines where Windows Terminal is the default console
+    # host: Windows Terminal has a long-standing bug where it does not
+    # reliably honor SW_HIDE/-WindowStyle Hidden for the console it hosts
+    # (see microsoft/terminal#12464 and the same issue's many duplicates)
+    # -- exactly the field-reported "shortcut opens a console window
+    # alongside the GUI" symptom this whole change exists to fix.
+    # wscript.exe, by contrast, is a genuinely windowless host: it never
+    # allocates a console at all, so there is nothing for Windows Terminal
+    # (or any other console host) to fail to hide. Pointing the .lnk at
+    # wscript.exe "<PROGRAM>\launch.vbs" instead of directly at
+    # powershell.exe sidesteps the Windows Terminal bug entirely rather
+    # than depending on it to honor a hide request. -WindowStyle Hidden is
+    # still passed to powershell.exe itself here too (belt-and-suspenders,
+    # cheap, and correct on hosts where Windows Terminal is NOT the
+    # default), and objShell.Run's own window-style argument is 0
+    # (SW_HIDE) rather than merely minimized, since VBScript's WshShell.Run
+    # -- unlike a .lnk's WindowStyle property -- has an actual "hidden"
+    # value to ask for.
     param(
         [Parameter(Mandatory = $true)][string]$ProgramDir,
         [string]$SystemRoot = $env:SystemRoot
     )
     $managerPath = Join-Path $ProgramDir 'manager.ps1'
     $exe = Get-WindowsPowerShellExePath -SystemRoot $SystemRoot
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File ' + (ConvertTo-QuotedCommandLineArgument -Value $managerPath)
+    $commandLine = (ConvertTo-QuotedCommandLineArgument -Value $exe) + ' -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + (ConvertTo-QuotedCommandLineArgument -Value $managerPath)
+
+    # VBScript string-literal escaping: a literal double quote inside a
+    # VBScript string is written as TWO double quotes. $commandLine already
+    # contains double quotes of its own (from ConvertTo-QuotedCommandLine-
+    # Argument wrapping the exe path and the manager.ps1 path, both of
+    # which may contain spaces, e.g. "C:\Program Files\..."); doubling
+    # every one of those is what makes the whole command line safe to
+    # embed as ONE VBScript string argument to objShell.Run.
+    $vbsLiteral = $commandLine.Replace('"', '""')
+
+    $line1 = 'Set objShell = CreateObject("WScript.Shell")'
+    $line2 = 'objShell.Run "' + $vbsLiteral + '", 0, False'
+    return $line1 + "`r`n" + $line2 + "`r`n"
+}
+
+function Get-ManagerShortcutDefinition {
+    # The target/arguments/working-directory a "Stream Config Profiles"
+    # shortcut should carry, given PROGRAM (the folder Install-App copies
+    # manager.ps1 into, and also writes launch.vbs into -- see
+    # Get-ManagerLaunchVbsContent). The shortcut's TARGET is wscript.exe
+    # "<PROGRAM>\launch.vbs", not powershell.exe directly -- see
+    # Get-ManagerLaunchVbsContent's own comment for why (Windows Terminal,
+    # the default Windows 11 console host, does not reliably honor a
+    # console-hiding request made directly to powershell.exe). The .lnk
+    # file's own WindowStyle property is ALSO set to 7 (minimized) as
+    # cheap belt-and-suspenders, though wscript.exe itself never shows a
+    # window to begin with.
+    param(
+        [Parameter(Mandatory = $true)][string]$ProgramDir,
+        [string]$SystemRoot = $env:SystemRoot
+    )
+    $launchVbsPath = Get-ManagerLaunchVbsPath -ProgramDir $ProgramDir
+    $exe = Get-WscriptExePath -SystemRoot $SystemRoot
+    $arguments = ConvertTo-QuotedCommandLineArgument -Value $launchVbsPath
     return [PSCustomObject]@{
         Name             = 'Stream Config Profiles'
         TargetPath       = $exe
         Arguments        = $arguments
         WorkingDirectory = $ProgramDir
+        WindowStyle      = 7
     }
 }
 
@@ -620,6 +697,13 @@ function New-ShortcutFile {
     $shortcut.TargetPath = $Definition.TargetPath
     $shortcut.Arguments = $Definition.Arguments
     $shortcut.WorkingDirectory = $Definition.WorkingDirectory
+    if ($null -ne $Definition.WindowStyle) {
+        # 7 = minimized (see Get-ManagerShortcutDefinition's own comment) --
+        # WScript.Shell's WindowStyle property has no "hidden" value of its
+        # own, so minimized is the closest a .lnk file can get on top of the
+        # -WindowStyle Hidden already passed to powershell.exe itself.
+        $shortcut.WindowStyle = $Definition.WindowStyle
+    }
     $shortcut.Save()
 }
 
@@ -2021,6 +2105,25 @@ function Get-WindowsPowerShellExePath {
     return $candidate
 }
 
+function Get-WscriptExePath {
+    # Fully-qualified path to wscript.exe (the windowless Windows Script
+    # Host), the shortcut TARGET for launching launch.vbs -- see
+    # Get-ManagerShortcutDefinition's own comment on why a .lnk points at
+    # wscript.exe/launch.vbs rather than directly at powershell.exe.
+    # Same never-a-bare-name reasoning as Get-WindowsPowerShellExePath:
+    # CreateProcess's unqualified-name search order checks the CURRENT
+    # DIRECTORY first, so a bare "wscript.exe" is plantable by anything
+    # that can drop a file into whatever folder happens to be current when
+    # the shortcut resolves it. Falls back to the bare name only if
+    # $env:SystemRoot is unavailable (non-Windows test hosts), where none
+    # of this is ever actually invoked.
+    param([string]$SystemRoot = $env:SystemRoot)
+    if ([string]::IsNullOrEmpty($SystemRoot)) {
+        return 'wscript.exe'
+    }
+    return Join-Path (Join-Path $SystemRoot 'System32') 'wscript.exe'
+}
+
 function ConvertTo-QuotedCommandLineArgument {
     # Quotes a single value per the escaping rules every native Win32
     # process (including powershell.exe) expects from CommandLineToArgvW:
@@ -2073,6 +2176,16 @@ function ConvertTo-ElevatedArgumentString {
         [hashtable]$Parameters = @{}
     )
 
+    # Console-hiding for this re-entry is done via Start-ElevatedManagerProcess's
+    # OWN -WindowStyle Hidden on Start-Process (see there), not by adding a
+    # "-WindowStyle Hidden" token to this command-line string: powershell.exe
+    # itself would honor it fine on real Windows, but this exact string is
+    # also fed to a REAL child process on non-Windows CI hosts by the
+    # end-to-end elevation tests below (Invoke-E2EElevatedRegisterWatchdog),
+    # and pwsh's own -WindowStyle switch is "not implemented on this
+    # platform" outside Windows -- it would crash the child before it ever
+    # got to -Action parsing. Start-Process's -WindowStyle parameter hides
+    # the same console without ever touching this string.
     $argParts = New-Object System.Collections.Generic.List[string]
     $argParts.Add('-NoProfile')
     $argParts.Add('-ExecutionPolicy')
@@ -2149,11 +2262,25 @@ function Start-ElevatedManagerProcess {
     # ArgumentList is a single, already-quoted command-line string (see
     # ConvertTo-ElevatedArgumentString) -- Start-Process passes a single
     # array element straight through with no further quoting or splitting.
+    #
+    # -WindowStyle Hidden is Start-Process's OWN parameter (STARTUPINFO's
+    # show state at CreateProcess time), not a "-WindowStyle Hidden" token
+    # added to ArgumentList -- this elevated re-entry is always the
+    # headless retry of a GUI action (see Invoke-Elevated's own comment:
+    # direct interactive CLI -Action usage never goes through this
+    # function), so there is no terminal for it to print to and a visible
+    # console here is just the field-reported "extra console window" bug
+    # recurring on the elevation-retry path. Kept off ArgumentList
+    # specifically because that exact string is also fed to a real child
+    # process by the non-Windows end-to-end elevation tests (see
+    # ConvertTo-ElevatedArgumentString's own comment) -- pwsh's own
+    # -WindowStyle switch is unimplemented outside Windows and would crash
+    # that child immediately.
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][string]$ArgumentList
     )
-    return Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Verb RunAs -Wait -PassThru
+    return Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Verb RunAs -WindowStyle Hidden -Wait -PassThru
 }
 
 function Invoke-Elevated {
@@ -2415,7 +2542,13 @@ function Start-GuiInStaIfNeeded {
         # relaunch (a ManagerScriptPath containing a space, e.g. under
         # "C:\Users\John Doe\...", would otherwise break this relaunch too).
         $psExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        $argumentString = '-NoProfile -sta -File ' + (ConvertTo-QuotedCommandLineArgument -Value $ManagerScriptPath)
+        # -WindowStyle Hidden: this relaunch is a same-GUI self-relaunch (the
+        # wrong-apartment process returns immediately and shows nothing --
+        # see this function's own summary), never a direct interactive CLI
+        # invocation, so there is no terminal it should be printing to; a
+        # visible console here is exactly the field-reported "two windows"
+        # bug, just from the STA-retry path instead of the shortcut.
+        $argumentString = '-NoProfile -sta -WindowStyle Hidden -File ' + (ConvertTo-QuotedCommandLineArgument -Value $ManagerScriptPath)
         Start-Process -FilePath $psExe -ArgumentList $argumentString | Out-Null
         return $true
     }
