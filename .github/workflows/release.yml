@@ -65,10 +65,16 @@ jobs:
         shell: pwsh
         run: ./tests/manager-tests.ps1
 
+      - name: Run make-dist test suite
+        shell: pwsh
+        run: ./tests/make-dist-tests.ps1
+
   # ---------------------------------------------------------------------
   # (b) Build: inline the payload slots to produce a self-contained
-  # dist\manager.ps1 + dist\Install.bat, then verify the result. A
-  # parse-check alone passes just as happily on a dist file whose payload
+  # dist\manager.ps1, then wrap that into dist\StreamConfigProfiles-Setup.bat
+  # (the single double-clickable installer -- see build/make-dist.ps1's own
+  # self-test for how that wrapping is verified), then verify the result.
+  # A parse-check alone passes just as happily on a dist file whose payload
   # slots were never actually replaced (still bare markers, falling back
   # to dev mode) or landed in the wrong slot -- see the byte-identical
   # payload assertion below, which is what SPEC.md's "verify both payload
@@ -132,13 +138,13 @@ jobs:
           }
           Write-Host 'dist/manager.ps1 payload verified byte-identical to source.' -ForegroundColor Green
 
-      - name: Verify dist/Install.bat was produced
+      - name: Verify dist/StreamConfigProfiles-Setup.bat was produced
         shell: pwsh
         run: |
-          if (-not (Test-Path -LiteralPath 'dist/Install.bat')) {
-              throw 'dist/Install.bat was not produced by make-dist.ps1'
+          if (-not (Test-Path -LiteralPath 'dist/StreamConfigProfiles-Setup.bat')) {
+              throw 'dist/StreamConfigProfiles-Setup.bat was not produced by make-dist.ps1'
           }
-          Write-Host 'dist/Install.bat present.' -ForegroundColor Green
+          Write-Host 'dist/StreamConfigProfiles-Setup.bat present.' -ForegroundColor Green
 
       - name: Upload dist as a build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -146,7 +152,7 @@ jobs:
           name: dist
           path: |
             dist/manager.ps1
-            dist/Install.bat
+            dist/StreamConfigProfiles-Setup.bat
           if-no-files-found: error
           retention-days: 7
 
@@ -232,7 +238,7 @@ jobs:
           # tampered download).
           subject-path: |
             dist/manager.ps1
-            dist/Install.bat
+            dist/StreamConfigProfiles-Setup.bat
             dist/SHA256SUMS.txt
 
       - name: Create or update GitHub Release and attach dist assets
@@ -250,14 +256,14 @@ jobs:
           # creating.
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
+              dist/StreamConfigProfiles-Setup.bat \
               dist/manager.ps1 \
-              dist/Install.bat \
               dist/SHA256SUMS.txt \
               --clobber
           else
             gh release create "$RELEASE_TAG" \
+              dist/StreamConfigProfiles-Setup.bat \
               dist/manager.ps1 \
-              dist/Install.bat \
               dist/SHA256SUMS.txt \
               --title "$RELEASE_TAG" \
               --generate-notes

@@ -1,7 +1,9 @@
 <#
 .SYNOPSIS
     Release build: produces a self-contained dist\manager.ps1 (payload
-    slots inlined) plus dist\Install.bat.
+    slots inlined) plus dist\StreamConfigProfiles-Setup.bat, a single
+    double-clickable installer that embeds that same manager.ps1 as its
+    payload.
 
 .DESCRIPTION
     Reads manager.ps1 from the repo root and replaces its two
@@ -18,6 +20,21 @@
     (marker still present) apart from a release build (real content
     present) at runtime -- see Test-PayloadEmpty in manager.ps1.
 
+    dist\manager.ps1 is then wrapped into dist\StreamConfigProfiles-Setup.bat:
+    a small ASCII batch header (see New-DistSetupBatHeaderText) followed by
+    a unique marker line, followed by the full dist\manager.ps1 content
+    verbatim as raw bytes. The header stashes its own fully-qualified path
+    ("%~f0") into an SCP_SELF environment variable, then runs a short
+    PowerShell -Command snippet that re-reads that same file via
+    $env:SCP_SELF (an environment variable, not text spliced into the
+    command line -- see New-DistSetupBatExtractCommandText for why that
+    distinction matters), locates the marker, extracts everything after it
+    to a fresh random folder under %TEMP% as manager.ps1, then runs that
+    with -File (never Invoke-Expression) and exits with its exit code. See
+    New-DistSetupBatExtractCommandText for the extraction algorithm itself,
+    and Get-ExtractedSetupPayloadBytes for the byte-identical
+    re-implementation this script uses to self-test it.
+
     Fails loudly (non-zero exit, clear message) if:
       - manager.ps1 / sync-configs.ps1 / paths.example.txt are missing
       - either marker line is missing, or appears more than once
@@ -27,6 +44,13 @@
         payload silently if injected
       - the resulting dist\manager.ps1 does not parse as valid PowerShell
         (checked with the language parser, not by executing it)
+      - the setup-bat payload marker text is found inside the manager.ps1
+        content it is about to wrap (would make the marker ambiguous)
+      - self-testing the produced dist\StreamConfigProfiles-Setup.bat --
+        running the same extraction algorithm the embedded batch header
+        uses, in-process, cross-platform -- does not yield a manager.ps1
+        byte-identical to dist\manager.ps1, or that extracted copy does
+        not parse as valid PowerShell
 
     Dual-compatible with Windows PowerShell 5.1 and pwsh 7: no ternary, no
     ??, no && / ||, two-argument Join-Path only, explicit -Encoding on
@@ -38,13 +62,26 @@
     script lives in <repo>\build\make-dist.ps1).
 
 .PARAMETER OutDir
-    Where dist\manager.ps1 and dist\Install.bat are written. Defaults to
-    <RepoRoot>\dist.
+    Where dist\manager.ps1 and dist\StreamConfigProfiles-Setup.bat are
+    written. Defaults to <RepoRoot>\dist.
+
+.PARAMETER NoRun
+    When set, this file only defines its functions/variables and returns
+    without running the build. Used by a test harness that dot-sources
+    this file to call its functions directly against sandbox/fixture
+    inputs (see tests\make-dist-tests.ps1).
 #>
 
 param(
     [string]$RepoRoot,
-    [string]$OutDir
+    [string]$OutDir,
+
+    # When set, this file only defines its functions/variables and returns
+    # without running the build (or calling exit) -- exactly the same
+    # -NoRun contract manager.ps1 offers, so a test harness can dot-source
+    # this script and call its functions directly instead of only being
+    # able to run it end-to-end.
+    [switch]$NoRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,6 +103,20 @@ $script:Utf8NoBomEncoding = New-Object System.Text.UTF8Encoding($false)
 
 $script:EngineMarker = '<#PAYLOAD:ENGINE#>'
 $script:TemplateMarker = '<#PAYLOAD:TEMPLATE#>'
+
+# ---------------------------------------------------------------------------
+# StreamConfigProfiles-Setup.bat payload marker -- a plain ASCII line, unique
+# enough that it will not occur inside manager.ps1's own text (verified at
+# build time by Assert-NoSetupMarkerCollision below, not assumed). The batch
+# header always exits before this line is reached (see
+# New-DistSetupBatHeaderText), so cmd.exe never parses anything after it;
+# the embedded PowerShell -Command snippet re-reads the file's raw bytes and
+# finds this exact byte sequence to know where the header ends and the
+# manager.ps1 payload begins. ASCII-only and free of quote characters, so it
+# can be dropped straight into a single-quoted PowerShell string literal
+# with no escaping.
+# ---------------------------------------------------------------------------
+$script:SetupPayloadMarker = '##STREAMCONFIGPROFILES_SETUP_PAYLOAD_MARKER_v1##'
 
 function Get-RepoRootResolved {
     param([string]$RepoRoot)
@@ -213,6 +264,31 @@ function New-DistManagerContent {
     return [string]::Join("`n", $result.ToArray())
 }
 
+function Test-CommandTextParsesCleanly {
+    # Same idea as Test-ScriptParsesCleanly, but for a bare command-text
+    # string (New-DistSetupBatExtractCommandText's minified -Command
+    # snippet) rather than a file on disk -- ParseInput, not ParseFile.
+    # Invoke-SetupBatSelfTest only ever exercises
+    # Get-ExtractedSetupPayloadBytes, a deliberately independent
+    # re-implementation of the byte-extraction half of that snippet; it
+    # proves the .bat's byte layout is extractable, not that the ~900
+    # character minified snippet actually embedded in the shipped .bat is
+    # itself syntactically valid PowerShell. A one-character typo there
+    # would otherwise only surface the first time a real user double-
+    # clicks the installer.
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandText,
+        [ref]$ParseErrors
+    )
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput($CommandText, [ref]$tokens, [ref]$errors) | Out-Null
+    if ($null -ne $ParseErrors) {
+        $ParseErrors.Value = $errors
+    }
+    return (@($errors).Count -eq 0)
+}
+
 function Test-ScriptParsesCleanly {
     # Parses (does not execute) the given script text with the PowerShell
     # language parser -- available in both Windows PowerShell 5.1 and
@@ -231,41 +307,326 @@ function Test-ScriptParsesCleanly {
     return (@($errors).Count -eq 0)
 }
 
-function New-DistInstallBatContent {
-    # Tiny launcher, CRLF (native to .bat files). Deliberately does NOT
-    # request elevation: manager.ps1's GUI never runs elevated wholesale --
-    # it only relaunches itself elevated (Start-Process -Verb RunAs) for
-    # the specific headless actions that actually need admin rights (conf
-    # under Program Files, service restart, and the uninstall paths that
-    # touch protected locations -- watchdog registration/unregistration is
-    # user-level and never elevates, CONTRACT B). -ExecutionPolicy Bypass
-    # here is scoped to this one child
-    # process only; it never changes a machine- or user-level policy
-    # setting. That bypass exists because a freshly downloaded manager.ps1
-    # has no Authenticode signature, so a double-click under the default
-    # Windows execution policy (Restricted, or AllSigned in some
-    # environments) would otherwise refuse to run it at all.
+function New-DistSetupBatExtractCommandText {
+    # The short PowerShell -Command snippet embedded in the batch header,
+    # as ONE logical line (statements separated by ';', no line breaks --
+    # required, since it is passed as a single -Command argument on cmd's
+    # one physical header line). Built from a single-quoted here-string so
+    # none of its many literal '$' variable references or single-quoted
+    # string literals need any escaping in this source file, and no
+    # accidental interpolation happens against make-dist.ps1's own scope.
+    #
+    # What it does, in order:
+    #   1. Reads its own file's raw bytes via $env:SCP_SELF -- an
+    #      environment variable New-DistSetupBatHeaderText's own "set
+    #      "SCP_SELF=%~f0"" line populates with the setup .bat's
+    #      fully-qualified path BEFORE powershell.exe is even launched.
+    #      This is data, not source text: an environment variable's VALUE
+    #      is never parsed as PowerShell, so it round-trips ANY legal
+    #      filename character -- including a single quote -- verbatim.
+    #      Splicing "%~f0"'s cmd-expanded text directly into a
+    #      single-quoted PowerShell literal (the earlier approach) breaks
+    #      the instant that expanded path contains an apostrophe (a
+    #      perfectly legal Windows filename/folder-name character, e.g.
+    #      "C:\Users\O'Brien\Downloads\...") and is a script-injection
+    #      point for a deliberately renamed download besides -- the `set`
+    #      indirection removes both problems at once.
+    #   2. Byte-searches (no text encoding involved at all, so there is no
+    #      CRLF/LF or codepage ambiguity to get wrong) for the literal
+    #      marker bytes and fails loudly (Write-Error + exit 1) if they are
+    #      not found -- e.g. a truncated or corrupted download.
+    #   3. Skips exactly the marker's own trailing line terminator, if any
+    #      -- one byte for a bare LF, two for CRLF, zero for neither --
+    #      so this is robust regardless of which convention actually
+    #      follows the marker line. Every byte-index read here is bounds-
+    #      checked ($after -lt $b.Length) before it happens, and an empty
+    #      payload (marker sits at the literal end of the file) fails
+    #      loudly instead of silently mis-slicing -- matching
+    #      Get-ExtractedSetupPayloadBytes, the self-test's independent
+    #      re-implementation of this same algorithm.
+    #   4. Writes every remaining byte, unchanged, to a fresh
+    #      GUID-named folder under %TEMP% as manager.ps1. This is a raw
+    #      byte copy, not a text write through any Encoding -- the payload
+    #      bytes ARE dist\manager.ps1's own UTF-8-no-BOM bytes already, so
+    #      copying them verbatim is what makes the extracted file
+    #      byte-identical to dist\manager.ps1 (see
+    #      Get-ExtractedSetupPayloadBytes, which self-tests exactly this).
+    #   5. Runs that file with -ExecutionPolicy Bypass -File (never
+    #      Invoke-Expression -- extract-to-file-then-run is auditable: the
+    #      exact bytes about to execute can be inspected on disk first).
+    #      $LASTEXITCODE is captured into a local variable and defaulted to
+    #      1 if it is ever $null (e.g. the "&" invocation never actually
+    #      ran -- powershell.exe missing/blocked -- which surfaces as a
+    #      non-terminating CommandNotFound error that lets execution fall
+    #      through to the next statement rather than stopping the script),
+    #      so a launch that never happened can never be reported as a
+    #      successful exit 0. The %TEMP% extraction folder is removed
+    #      afterward (best-effort) so a repeated double-click does not
+    #      accumulate one throwaway copy of manager.ps1 per run.
+    #
+    # Deliberately free of: any '%' at all (the one previously-intentional
+    # "%~f0" is gone now that the path travels through $env:SCP_SELF
+    # instead -- see point 1 -- so a second '%' can never risk cmd
+    # re-expanding something PowerShell should own, e.g. %TEMP%, which
+    # this snippet reads via $env:TEMP / $env:SystemRoot itself); any '"'
+    # (every string literal here uses single quotes, so wrapping the whole
+    # snippet in one pair of double quotes for the -Command argument can
+    # never go unbalanced); any '^', '!', or unescaped batch-significant
+    # character outside of the one intentional '&' call operator -- which
+    # sits inside the -Command argument's quotes, where cmd.exe's
+    # quote-parity rule (an even number of '"' seen so far means "outside
+    # quotes"; odd means "inside") makes '&', '|', '(' and ')' literal text
+    # handed to the child process rather than cmd metacharacters, exactly
+    # the same way "powershell -Command \"a | b\"" always has, in practice,
+    # passed its pipe straight through to PowerShell rather than piping cmd
+    # commands.
+    #
+    # The marker is spliced in as two concatenated halves (__MARKER_A__ +
+    # __MARKER_B__), not the single contiguous string -- deliberately, so
+    # this command's OWN text never contains the marker as one unbroken
+    # byte sequence. Splicing it in whole would make the marker occur
+    # TWICE in the finished file (once right here, describing what to
+    # search for, and once more as the actual header-ending delimiter
+    # line below it), and a first-match byte search -- exactly what this
+    # snippet performs -- would then find this description of the marker
+    # instead of the real delimiter, extracting the tail of its own
+    # command line plus the batch footer as a bogus "payload" instead of
+    # manager.ps1. Splitting it here keeps the real marker line the only
+    # place the full sequence appears, so first-match search is correct.
+    $template = @'
+$p=$env:SCP_SELF;$b=[IO.File]::ReadAllBytes($p);$mk=[Text.Encoding]::ASCII.GetBytes('__MARKER_A__'+'__MARKER_B__');$n=$mk.Length;$idx=-1;for($i=0;$i -le $b.Length-$n;$i++){if($b[$i] -eq $mk[0]){$ok=$true;for($j=1;$j -lt $n;$j++){if($b[$i+$j] -ne $mk[$j]){$ok=$false;break}};if($ok){$idx=$i;break}}};if($idx -lt 0){Write-Error 'stream-config-profiles: payload marker not found -- this setup file is corrupt or truncated.';exit 1};$after=$idx+$n;if($after -lt $b.Length -and $b[$after] -eq 13){$after++};if($after -lt $b.Length -and $b[$after] -eq 10){$after++};if($after -ge $b.Length){Write-Error 'stream-config-profiles: empty payload -- this setup file is corrupt or truncated.';exit 1};$len=$b.Length-$after;$pl=New-Object byte[] $len;[Array]::Copy($b,$after,$pl,0,$len);$dir=Join-Path $env:TEMP ('scp_'+[Guid]::NewGuid().ToString('N'));New-Item -ItemType Directory -Path $dir -Force | Out-Null;$mp=Join-Path $dir 'manager.ps1';[IO.File]::WriteAllBytes($mp,$pl);$psExe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe';& $psExe -NoProfile -ExecutionPolicy Bypass -File $mp;$ec=$LASTEXITCODE;if($null -eq $ec){$ec=1};Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue;exit $ec
+'@
+    $splitIndex = [int]([Math]::Floor($script:SetupPayloadMarker.Length / 2))
+    $markerPartA = $script:SetupPayloadMarker.Substring(0, $splitIndex)
+    $markerPartB = $script:SetupPayloadMarker.Substring($splitIndex)
+    return $template.Replace('__MARKER_A__', $markerPartA).Replace('__MARKER_B__', $markerPartB)
+}
+
+function New-DistSetupBatHeaderText {
+    # The small ASCII batch header, CRLF (native to .bat files), that
+    # precedes the manager.ps1 payload in dist\StreamConfigProfiles-Setup.bat.
+    # Ends with an unconditional "exit /b" BEFORE the marker line -- cmd.exe
+    # executes a batch file strictly top-to-bottom (it does not pre-scan or
+    # buffer the whole file), so once that exit statement runs, cmd never
+    # reads -- let alone tries to parse as batch commands -- the marker
+    # line or anything after it, no matter what the manager.ps1 payload
+    # happens to contain (blank lines, lines that look like labels or FOR
+    # loops, '%' sequences, embedded quotes, etc.).
+    #
+    # Deliberately does NOT request elevation, for the same reason the
+    # retired Install.bat launcher didn't: manager.ps1's GUI never runs
+    # elevated wholesale, only relaunching itself elevated (Start-Process
+    # -Verb RunAs) for the specific headless actions that actually need
+    # admin rights; see Invoke-GuiElevatable in manager.ps1.
+    #
+    # -ExecutionPolicy Bypass is scoped to the one extracted-and-launched
+    # manager.ps1 process only; it never changes a machine- or user-level
+    # policy setting. That bypass exists because a freshly downloaded
+    # manager.ps1 has no Authenticode signature, so a double-click under
+    # the default Windows execution policy (Restricted, or AllSigned in
+    # some environments) would otherwise refuse to run it at all.
+    #
+    # The fully-qualified path to powershell.exe (rather than a bare
+    # "powershell.exe") matters because this file is meant to be
+    # double-clicked straight out of a Downloads folder: cmd.exe resolves
+    # an unqualified command name from the CURRENT DIRECTORY before PATH,
+    # so a bare name would run whatever powershell.exe happened to be
+    # planted alongside it instead of the real shell.
+    $commandText = New-DistSetupBatExtractCommandText
     $lines = @(
         '@echo off',
-        'rem stream-config-profiles installer launcher.',
+        'rem stream-config-profiles single-file installer.',
+        'rem',
+        'rem This file is a polyglot: everything from "@echo off" down to the',
+        'rem "exit /b" line just below is an ordinary batch script; cmd.exe',
+        'rem runs it, executes it, and stops there. Everything AFTER the',
+        'rem marker line that follows is the full contents of manager.ps1,',
+        'rem appended verbatim as raw bytes -- cmd.exe never reads that far,',
+        'rem so it is never parsed as batch commands no matter what it',
+        'rem contains. The short PowerShell command invoked below re-reads',
+        'rem this same file''s raw bytes, finds the marker, and extracts',
+        'rem everything after it to %TEMP% as manager.ps1, then runs that',
+        'rem extracted copy with -File (never Invoke-Expression, so the',
+        'rem exact bytes about to execute can always be inspected on disk',
+        'rem first).',
         'rem',
         'rem manager.ps1 ships unsigned, so a fresh Windows machine''s default',
-        'rem execution policy blocks it on double-click. -ExecutionPolicy Bypass',
-        'rem below applies ONLY to this one launched process -- it does not',
-        'rem change any machine or user policy setting. manager.ps1 itself',
-        'rem elevates (via a separate, explicit relaunch) only the specific',
-        'rem operations that actually need admin rights; this launcher never',
-        'rem requests elevation.',
+        'rem execution policy blocks it on double-click; -ExecutionPolicy',
+        'rem Bypass below applies ONLY to that one extracted-and-launched',
+        'rem process -- it never changes a machine- or user-level policy',
+        'rem setting.',
         'rem',
-        'rem The fully-qualified path below (rather than a bare "powershell.exe")',
-        'rem matters because this file is meant to be double-clicked straight out',
-        'rem of a Downloads folder: cmd.exe resolves an unqualified command name',
-        'rem from the CURRENT DIRECTORY before PATH, so a bare name would run',
-        'rem whatever powershell.exe happened to be planted alongside it instead',
-        'rem of the real shell.',
-        '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0manager.ps1"'
+        'rem SCP_SELF carries this file''s own fully-qualified path to the',
+        'rem PowerShell command below as an ENVIRONMENT VARIABLE, not as text',
+        'rem spliced into the command line -- %~f0''s expansion can contain a',
+        'rem single quote (a perfectly legal Windows path character, e.g. a',
+        'rem profile folder named O''Brien), and an environment variable''s',
+        'rem VALUE is never re-parsed as PowerShell source the way a literal',
+        'rem splice would be. The quotes in "SCP_SELF=%~f0" are cmd''s own --',
+        'rem they protect the assignment from spaces and other special',
+        'rem characters in the expanded path -- and have no bearing on the',
+        'rem PowerShell command that follows.',
+        ('set "SCP_SELF=%~f0"'),
+        ('"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "' + $commandText + '"'),
+        'exit /b %ERRORLEVEL%',
+        $script:SetupPayloadMarker
     )
     return [string]::Join("`r`n", $lines) + "`r`n"
+}
+
+function Assert-NoSetupMarkerCollision {
+    # The setup-bat payload marker must occur exactly once in the produced
+    # file -- as the header's own marker line -- for the extraction
+    # algorithm's first-match byte search to be unambiguously correct. This
+    # checks the one variable part (manager.ps1's own text, about to become
+    # the payload) does not already happen to contain the marker text
+    # somewhere inside it; the header text is authored directly above and
+    # provably contains it exactly once.
+    param([Parameter(Mandatory = $true)][string]$ManagerText)
+    if ($ManagerText.Contains($script:SetupPayloadMarker)) {
+        throw "make-dist: dist\manager.ps1 content already contains the setup-bat payload marker ('$($script:SetupPayloadMarker)') -- this would make the marker ambiguous. Refusing to build; change `$script:SetupPayloadMarker in build\make-dist.ps1."
+    }
+}
+
+function New-DistSetupBatBytes {
+    # Assembles the full StreamConfigProfiles-Setup.bat file as a byte
+    # array: the ASCII header (CRLF line endings, ending in the marker
+    # line) immediately followed by the manager.ps1 payload's own bytes,
+    # unchanged. Concatenating raw byte arrays -- rather than building one
+    # big string and re-encoding it -- is what guarantees the payload
+    # portion of the resulting file is byte-for-byte identical to
+    # dist\manager.ps1 regardless of its own line-ending convention (LF,
+    # per this repo's -- see Split-TextLines -- vs. the header's CRLF).
+    param(
+        [Parameter(Mandatory = $true)][string]$ManagerText,
+        [Parameter(Mandatory = $true)][byte[]]$ManagerBytes
+    )
+    Assert-NoSetupMarkerCollision -ManagerText $ManagerText
+    $headerBytes = $script:Utf8NoBomEncoding.GetBytes((New-DistSetupBatHeaderText))
+    $combined = New-Object byte[] ($headerBytes.Length + $ManagerBytes.Length)
+    [System.Array]::Copy($headerBytes, 0, $combined, 0, $headerBytes.Length)
+    [System.Array]::Copy($ManagerBytes, 0, $combined, $headerBytes.Length, $ManagerBytes.Length)
+    return $combined
+}
+
+function Find-ByteSequenceIndex {
+    # First index of $Needle inside $Haystack, or -1. A plain byte-array
+    # search (no text encoding involved anywhere), so it is exactly the
+    # same kind of operation -- not merely the same result -- as the
+    # embedded batch header's own marker search, just written for
+    # readability here instead of being minified for a single -Command
+    # line.
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Haystack,
+        [Parameter(Mandatory = $true)][byte[]]$Needle
+    )
+    $n = $Needle.Length
+    if ($n -eq 0) {
+        return -1
+    }
+    for ($i = 0; $i -le ($Haystack.Length - $n); $i++) {
+        if ($Haystack[$i] -eq $Needle[0]) {
+            $isMatch = $true
+            for ($j = 1; $j -lt $n; $j++) {
+                if ($Haystack[$i + $j] -ne $Needle[$j]) {
+                    $isMatch = $false
+                    break
+                }
+            }
+            if ($isMatch) {
+                return $i
+            }
+        }
+    }
+    return -1
+}
+
+function Get-ExtractedSetupPayloadBytes {
+    # Re-implements -- deliberately as a second, independently-written pass
+    # rather than by re-using the embedded snippet's own text -- the exact
+    # extraction algorithm New-DistSetupBatExtractCommandText embeds in the
+    # batch header: find the marker's bytes, skip its trailing line
+    # terminator (CRLF, bare LF, or neither), return everything after that
+    # as the payload. Runs cross-platform in-process (no cmd.exe / no
+    # Windows dependency) so make-dist.ps1's self-test can verify the
+    # produced .bat's structure on any OS running pwsh.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $markerBytes = [System.Text.Encoding]::ASCII.GetBytes($script:SetupPayloadMarker)
+    $idx = Find-ByteSequenceIndex -Haystack $bytes -Needle $markerBytes
+    if ($idx -lt 0) {
+        throw "make-dist: self-test could not find the setup-bat payload marker in $Path -- New-DistSetupBatHeaderText and Get-ExtractedSetupPayloadBytes have drifted apart."
+    }
+    $after = $idx + $markerBytes.Length
+    if ($after -lt $bytes.Length -and $bytes[$after] -eq 13) {
+        $after++
+    }
+    if ($after -lt $bytes.Length -and $bytes[$after] -eq 10) {
+        $after++
+    }
+    if ($after -ge $bytes.Length) {
+        return , (New-Object byte[] 0)
+    }
+    $length = $bytes.Length - $after
+    $payload = New-Object byte[] $length
+    [System.Array]::Copy($bytes, $after, $payload, 0, $length)
+    return , $payload
+}
+
+function Test-BytesEqual {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Left,
+        [Parameter(Mandatory = $true)][byte[]]$Right
+    )
+    if ($Left.Length -ne $Right.Length) {
+        return $false
+    }
+    for ($i = 0; $i -lt $Left.Length; $i++) {
+        if ($Left[$i] -ne $Right[$i]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Invoke-SetupBatSelfTest {
+    # Fails loudly if the just-produced StreamConfigProfiles-Setup.bat does
+    # not actually reproduce dist\manager.ps1 byte-for-byte when extracted
+    # by the same algorithm the embedded batch header uses, or if the
+    # extracted copy does not parse as valid PowerShell -- a parse-check of
+    # dist\manager.ps1 alone (see Test-ScriptParsesCleanly's other call
+    # site in Invoke-MakeDist) proves nothing about whether the .bat
+    # wrapper around it is actually extractable.
+    param(
+        [Parameter(Mandatory = $true)][string]$SetupBatPath,
+        [Parameter(Mandatory = $true)][byte[]]$ExpectedManagerBytes
+    )
+
+    $extracted = Get-ExtractedSetupPayloadBytes -Path $SetupBatPath
+    if (-not (Test-BytesEqual -Left $extracted -Right $ExpectedManagerBytes)) {
+        throw "make-dist: self-test FAILED -- extracting $SetupBatPath did not reproduce dist\manager.ps1 byte-for-byte (extracted $($extracted.Length) byte(s), expected $($ExpectedManagerBytes.Length)). Refusing to release."
+    }
+
+    $tempCopyPath = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N') + '-selftest-manager.ps1')
+    try {
+        [System.IO.File]::WriteAllBytes($tempCopyPath, $extracted)
+        $parseErrors = $null
+        $parsesCleanly = Test-ScriptParsesCleanly -Path $tempCopyPath -ParseErrors ([ref]$parseErrors)
+        if (-not $parsesCleanly) {
+            Write-Host 'make-dist: parse errors in the extracted setup-bat payload:' -ForegroundColor Red
+            foreach ($e in @($parseErrors)) {
+                Write-Host "  - $e" -ForegroundColor Red
+            }
+            throw "make-dist: self-test FAILED -- the manager.ps1 extracted from $SetupBatPath does not parse as valid PowerShell ($(@($parseErrors).Count) error(s)). Refusing to release."
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempCopyPath) {
+            Remove-Item -LiteralPath $tempCopyPath -Force
+        }
+    }
+
+    Write-Host 'make-dist: StreamConfigProfiles-Setup.bat self-test passed (extraction is byte-identical to dist\manager.ps1 and re-parses cleanly).' -ForegroundColor Green
 }
 
 function Invoke-MakeDist {
@@ -295,13 +656,10 @@ function Invoke-MakeDist {
     }
 
     $distManagerPath = Join-Path $resolvedOutDir 'manager.ps1'
-    $distInstallBatPath = Join-Path $resolvedOutDir 'Install.bat'
+    $distSetupBatPath = Join-Path $resolvedOutDir 'StreamConfigProfiles-Setup.bat'
 
     [System.IO.File]::WriteAllText($distManagerPath, $distManagerText, $script:Utf8NoBomEncoding)
-    [System.IO.File]::WriteAllText($distInstallBatPath, (New-DistInstallBatContent), $script:Utf8NoBomEncoding)
-
     Write-Host "make-dist: wrote $distManagerPath ($((Get-Item -LiteralPath $distManagerPath).Length) bytes)"
-    Write-Host "make-dist: wrote $distInstallBatPath ($((Get-Item -LiteralPath $distInstallBatPath).Length) bytes)"
 
     $parseErrors = $null
     $parsesCleanly = Test-ScriptParsesCleanly -Path $distManagerPath -ParseErrors ([ref]$parseErrors)
@@ -314,11 +672,36 @@ function Invoke-MakeDist {
     }
     Write-Host 'make-dist: dist\manager.ps1 parses cleanly.'
 
+    # dist\manager.ps1's own bytes (not re-derived from $distManagerText via
+    # a fresh Encoding call) are used as both the setup-bat payload and the
+    # self-test's expected value, so "byte-identical to dist\manager.ps1"
+    # means literally the file on disk, not merely "encoded the same way
+    # twice".
+    $distManagerBytes = [System.IO.File]::ReadAllBytes($distManagerPath)
+
+    $extractCommandText = New-DistSetupBatExtractCommandText
+    $extractParseErrors = $null
+    $extractParsesCleanly = Test-CommandTextParsesCleanly -CommandText $extractCommandText -ParseErrors ([ref]$extractParseErrors)
+    if (-not $extractParsesCleanly) {
+        Write-Host 'make-dist: parse errors in the embedded setup-bat extraction snippet:' -ForegroundColor Red
+        foreach ($e in @($extractParseErrors)) {
+            Write-Host "  - $e" -ForegroundColor Red
+        }
+        throw "make-dist: the extraction snippet embedded in StreamConfigProfiles-Setup.bat failed to parse ($(@($extractParseErrors).Count) error(s)) -- see above"
+    }
+    Write-Host 'make-dist: setup-bat extraction snippet parses cleanly.'
+
+    $setupBatBytes = New-DistSetupBatBytes -ManagerText $distManagerText -ManagerBytes $distManagerBytes
+    [System.IO.File]::WriteAllBytes($distSetupBatPath, $setupBatBytes)
+    Write-Host "make-dist: wrote $distSetupBatPath ($((Get-Item -LiteralPath $distSetupBatPath).Length) bytes)"
+
+    Invoke-SetupBatSelfTest -SetupBatPath $distSetupBatPath -ExpectedManagerBytes $distManagerBytes
+
     return [PSCustomObject]@{
-        ManagerPath   = $distManagerPath
-        InstallBatPath = $distInstallBatPath
-        RepoRoot      = $resolvedRepoRoot
-        OutDir        = $resolvedOutDir
+        ManagerPath  = $distManagerPath
+        SetupBatPath = $distSetupBatPath
+        RepoRoot     = $resolvedRepoRoot
+        OutDir       = $resolvedOutDir
     }
 }
 
@@ -326,12 +709,14 @@ function Invoke-MakeDist {
 # Entry point
 # ---------------------------------------------------------------------------
 
-try {
-    Invoke-MakeDist -RepoRoot $RepoRoot -OutDir $OutDir | Out-Null
-    Write-Host 'make-dist: build succeeded.' -ForegroundColor Green
-    exit 0
-}
-catch {
-    Write-Host "make-dist: FAILED -- $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+if (-not $NoRun) {
+    try {
+        Invoke-MakeDist -RepoRoot $RepoRoot -OutDir $OutDir | Out-Null
+        Write-Host 'make-dist: build succeeded.' -ForegroundColor Green
+        exit 0
+    }
+    catch {
+        Write-Host "make-dist: FAILED -- $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
 }

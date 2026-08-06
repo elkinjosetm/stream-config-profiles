@@ -89,6 +89,44 @@ function Unregister-WatchdogTask {
 }
 
 # ---------------------------------------------------------------------------
+# Shortcut creation shim -- redefine New-ShortcutFile, the one function in
+# manager.ps1 that touches WScript.Shell COM automation (Windows-only,
+# unavailable on this Linux test host). Records calls instead of creating a
+# real .lnk. Remove-ManagerShortcutFile is NOT shimmed -- deleting a file
+# needs no COM and is exercised for real against sandboxed paths.
+# ---------------------------------------------------------------------------
+
+$script:ShortcutCalls = New-Object System.Collections.Generic.List[object]
+
+# Shortcut paths New-ShortcutFile should THROW for when called (simulating a
+# locked/read-only folder). Empty by default; a scenario that needs this
+# sets it, then MUST reset it to @() afterward (in a finally block).
+$script:ShortcutCreateShouldThrowFor = @()
+
+function New-ShortcutFile {
+    param([string]$ShortcutPath, $Definition)
+    $script:ShortcutCalls.Add([PSCustomObject]@{ ShortcutPath = $ShortcutPath; Definition = $Definition })
+    if (@($script:ShortcutCreateShouldThrowFor) -contains $ShortcutPath) {
+        throw "Access is denied. (simulated failure for '$ShortcutPath')"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# User-identity shim -- redefine Get-CurrentWindowsUserSid, the one function
+# Get-ResolvedUserId isolates its WindowsIdentity.GetCurrent() SID lookup
+# behind, so the "no SID available" fallback branch (DOMAIN\User / bare
+# USERNAME) is exercised deterministically on EVERY platform this harness
+# runs on -- including real Windows CI, where a SID is always genuinely
+# available and the un-shimmed code path could never reach that branch at
+# all. Always returns $null (never a real SID); no test here needs the real
+# platform SID.
+# ---------------------------------------------------------------------------
+
+function Get-CurrentWindowsUserSid {
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------------
 
@@ -433,6 +471,24 @@ Invoke-Scenario -Name 'Watchdog: poll task is OFF by default (no -IncludePoll)' 
     Assert-That (@($poll).Count -eq 0) 'poll task must not be present unless -IncludePoll is passed'
 } | Out-Null
 
+Invoke-Scenario -Name 'Watchdog: Get-WatchdogTaskDefinitions -IncludeLogon:$false omits the Logon task entirely (poll-only never attempts the elevation-eligible registration)' -Body {
+    # Registering the Logon task (AtLogOn + session-unlock) is the
+    # operation that can prompt Windows for administrator approval, even
+    # though its principal is the calling user (see Register-Watchdog).
+    # A poll-only selection must never even ATTEMPT that registration, or
+    # unchecking Logon in the GUI would still trigger a spurious elevation
+    # prompt for a task the user explicitly does not want.
+    $noneDefs = Get-WatchdogTaskDefinitions -DataDir '/fake/data' -UserId 'TestUser' -IncludeLogon:$false
+    Assert-That (@($noneDefs).Count -eq 0) "with -IncludeLogon:`$false and no -IncludePoll, no tasks should be produced at all, found $(@($noneDefs).Count)"
+
+    $pollOnlyDefs = Get-WatchdogTaskDefinitions -DataDir '/fake/data' -UserId 'TestUser' -IncludeLogon:$false -IncludePoll -PollMinutes 10
+    Assert-That (@($pollOnlyDefs).Count -eq 1) "with -IncludeLogon:`$false -IncludePoll, exactly the Poll task should be produced, found $(@($pollOnlyDefs).Count)"
+    Assert-That ($pollOnlyDefs[0].Name -eq 'StreamConfigProfiles-Settle-Poll') 'the sole poll-only task should be Poll'
+
+    $defaultDefs = Get-WatchdogTaskDefinitions -DataDir '/fake/data' -UserId 'TestUser'
+    Assert-That (@($defaultDefs | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Logon' }).Count -eq 1) '-IncludeLogon should default to on (present) when omitted, matching every existing headless caller'
+} | Out-Null
+
 Invoke-Scenario -Name 'Watchdog: Register-Watchdog drives the isolated cmdlet wrappers (shimmed), not real ScheduledTasks' -Body {
     $script:WatchdogCalls.Clear()
     $results = Register-Watchdog -DataDir '/fake/data' -UserId 'TestUser' -IncludePoll -PollMinutes 10
@@ -447,10 +503,16 @@ Invoke-Scenario -Name 'Watchdog: Register-Watchdog drives the isolated cmdlet wr
     Assert-That (-not ($names -contains 'StreamConfigProfiles-Settle-Boot')) 'a Boot task should never be registered -- there is no registration path for it any more'
 } | Out-Null
 
-Invoke-Scenario -Name 'Watchdog: Register-Watchdog never needs elevation -- Logon and Poll are both Interactive/resolved user, never admin' -Body {
-    # Contract B: registering/unregistering the watchdog never needs
-    # elevation. Every real task definition today is user-level; there is
-    # no admin-principal path left to exercise.
+Invoke-Scenario -Name 'Watchdog: Register-Watchdog always registers a Limited-RunLevel, Interactive/resolved-user principal (registering the Logon trigger may still need admin approval)' -Body {
+    # The task's own RUNTIME principal (RunLevel/LogonType/UserId) is a
+    # separate axis from whether REGISTERING it needs elevation: on real
+    # Windows, Register-ScheduledTask needs administrator approval to
+    # create the Logon task's session-unlock/AtLogOn triggers even though
+    # the principal being registered is the calling user themself. Every
+    # real task definition today is still Limited/Interactive/user-level --
+    # there is no admin-principal path left to exercise -- but that is no
+    # longer the same claim as "registering it never needs elevation" (see
+    # Invoke-GuiElevatable's register-watchdog/unregister-watchdog routing).
     $script:WatchdogCalls.Clear()
     Register-Watchdog -DataDir '/fake/data' -UserId 'ExplicitUser' -IncludePoll -PollMinutes 10 | Out-Null
 
@@ -458,12 +520,76 @@ Invoke-Scenario -Name 'Watchdog: Register-Watchdog never needs elevation -- Logo
     $logon = @($registerCalls | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Logon' })[0]
     $poll = @($registerCalls | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Poll' })[0]
 
-    Assert-That (-not $logon.NeedsAdmin) 'Logon task should not need admin'
+    Assert-That (-not $logon.NeedsAdmin) 'Logon task RunLevel should still be Limited (not an admin principal)'
     Assert-That ($logon.LogonType -eq 'Interactive') "Logon task LogonType should be Interactive, got '$($logon.LogonType)'"
     Assert-That ($logon.UserId -eq 'ExplicitUser') "Logon task UserId should be the resolved caller-supplied UserId, got '$($logon.UserId)'"
-    Assert-That (-not $poll.NeedsAdmin) 'Poll task should not need admin'
+    Assert-That (-not $poll.NeedsAdmin) 'Poll task RunLevel should still be Limited (not an admin principal)'
     Assert-That ($poll.LogonType -eq 'Interactive') "Poll task LogonType should be Interactive, got '$($poll.LogonType)'"
     Assert-That ($poll.UserId -eq 'ExplicitUser') "Poll task UserId should be the resolved caller-supplied UserId, got '$($poll.UserId)'"
+} | Out-Null
+
+Invoke-Scenario -Name 'Watchdog: Register-Watchdog -IncludeLogon:$false registers only Poll -- a poll-only selection never attempts the elevation-eligible Logon registration' -Body {
+    $script:WatchdogCalls.Clear()
+    $results = Register-Watchdog -DataDir '/fake/data' -UserId 'TestUser' -IncludeLogon:$false -IncludePoll -PollMinutes 10
+
+    $registerCalls = @($script:WatchdogCalls | Where-Object { $_.Op -eq 'Register' })
+    Assert-That (@($registerCalls).Count -eq 1) "expected exactly 1 Register call (Poll only) with -IncludeLogon:`$false, got $(@($registerCalls).Count)"
+    Assert-That ($registerCalls[0].Name -eq 'StreamConfigProfiles-Settle-Poll') 'the only task registered should be Poll'
+    Assert-That (-not ($registerCalls | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Logon' })) 'the Logon task must not even be attempted when -IncludeLogon:$false'
+    Assert-That (@($results | Where-Object { -not $_.Success }).Count -eq 0) 'a poll-only registration should always succeed against the shim (and, on real Windows, unelevated -- the poll trigger never needs admin)'
+} | Out-Null
+
+Invoke-Scenario -Name 'Watchdog: Register-Watchdog is a desired-state reconciler -- unchecking Logon in the SAME call unregisters an already-registered Logon task, not just skips registering it' -Body {
+    # Regression for the GUI reconcile-delete bug: the wizard/main window
+    # used to unregister the "other direction" (unchecked box) via a
+    # SEPARATE Invoke-GuiSafe call, unelevated, after this one. Once
+    # registration itself could need elevation, that separate delete could
+    # fail against an admin-owned task with no elevated-retry path of its
+    # own. Folding the removal into Register-Watchdog means the single
+    # Invoke-GuiElevatable wrapper around this call covers both directions.
+    $script:WatchdogCalls.Clear()
+    $results = Register-Watchdog -DataDir '/fake/data' -UserId 'TestUser' -IncludeLogon:$false -IncludePoll -PollMinutes 10
+
+    $unregisterCalls = @($script:WatchdogCalls | Where-Object { $_.Op -eq 'Unregister' })
+    Assert-That (@($unregisterCalls | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Logon' }).Count -eq 1) 'unchecking Logon should unregister it in the same Register-Watchdog call, not just skip registering it'
+    Assert-That (-not ($unregisterCalls | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Poll' })) 'Poll was requested, so it must not be reconcile-unregistered'
+    $pollResult = @($results | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Poll' })[0]
+    $logonResult = @($results | Where-Object { $_.Name -eq 'StreamConfigProfiles-Settle-Logon' })[0]
+    Assert-That ($pollResult.Success -and $pollResult.Message -eq 'registered') 'Poll should still report a normal registration result'
+    Assert-That ($logonResult.Success) 'the reconcile-unregister of Logon should report success against the shim'
+} | Out-Null
+
+Invoke-Scenario -Name 'Watchdog: Register-Watchdog reconcile-unregister does NOT register-then-delete -- an unrequested task is never attempted as a registration in the first place' -Body {
+    $script:WatchdogCalls.Clear()
+    Register-Watchdog -DataDir '/fake/data' -UserId 'TestUser' -IncludePoll -PollMinutes 10 | Out-Null
+
+    # Default IncludeLogon:$true + explicit -IncludePoll -> both desired,
+    # nothing to reconcile-unregister.
+    Assert-That (@($script:WatchdogCalls | Where-Object { $_.Op -eq 'Unregister' }).Count -eq 0) 'when both tasks are desired, Register-Watchdog should not attempt to unregister anything'
+
+    $script:WatchdogCalls.Clear()
+    Register-Watchdog -DataDir '/fake/data' -UserId 'TestUser' -IncludeLogon:$false -PollMinutes 10 | Out-Null
+
+    # Neither task desired here (-IncludeLogon:$false, no -IncludePoll):
+    # both should be reconcile-unregistered, and NEITHER should ever appear
+    # as a Register call first.
+    $ops = @($script:WatchdogCalls | ForEach-Object { $_.Op })
+    Assert-That (-not ($ops -contains 'Register')) 'no task was requested, so Register-Watchdog must never attempt a Register call'
+    $unregisteredNames = @($script:WatchdogCalls | Where-Object { $_.Op -eq 'Unregister' } | ForEach-Object { $_.Name })
+    Assert-That ($unregisteredNames -contains 'StreamConfigProfiles-Settle-Logon') 'Logon should be reconcile-unregistered when not requested'
+    Assert-That ($unregisteredNames -contains 'StreamConfigProfiles-Settle-Poll') 'Poll should be reconcile-unregistered when not requested'
+} | Out-Null
+
+Invoke-Scenario -Name 'Watchdog: Register-Watchdog surfaces a failed reconcile-unregister as Success=$false, making it visible to Invoke-GuiElevatable' -Body {
+    $script:UnregisterShouldThrowFor = @('StreamConfigProfiles-Settle-Logon')
+    try {
+        $script:WatchdogCalls.Clear()
+        $results = Register-Watchdog -DataDir '/fake/data' -UserId 'TestUser' -IncludeLogon:$false -IncludePoll -PollMinutes 10
+        Assert-That (Test-ManagerResultIndicatesFailure -Result $results) 'a denied reconcile-unregister of an admin-owned Logon task must surface as an overall Success=$false, so Invoke-GuiElevatable can offer the elevated retry'
+    }
+    finally {
+        $script:UnregisterShouldThrowFor = @()
+    }
 } | Out-Null
 
 Invoke-Scenario -Name 'Watchdog: Get-SettleAction produces the exact contract-mandated command string' -Body {
@@ -712,23 +838,321 @@ Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString keeps a space
 } | Out-Null
 
 Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString renders switch/bool/int parameters correctly' -Body {
+    # Contract (see ConvertTo-ElevatedArgumentString's own comment): a
+    # present/true switch renders as a BARE -Name token; an absent/false
+    # switch is OMITTED entirely. Never an explicit -Name:$true/-Name:
+    # $false token -- powershell.exe/pwsh invoked with -File (exactly how
+    # Invoke-Elevated always re-launches this script) parses script
+    # arguments as literal, unevaluated strings, so an explicit ":$true"/
+    # ":$false" token fails to bind to a [SwitchParameter] at all (the
+    # actual field failure: "Cannot convert value "System.String" to type
+    # SwitchParameter").
     $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ RemoveData = [switch]$true; IncludePoll = [switch]$false; PollMinutes = 10 }
-    Assert-That ($argString -match '-RemoveData(?!\S)') 'a present switch should appear as a bare -Name'
-    Assert-That (-not ($argString -match '-IncludePoll')) 'an absent switch should not appear at all'
+    Assert-That ($argString -match '(?<!\S)-RemoveData(?!\S)') 'a present switch should appear as a bare -Name token'
+    Assert-That ($argString -notmatch '-RemoveData:') 'a present switch must never render an explicit :$true/:$false value'
+    Assert-That ($argString -notmatch '-IncludePoll(?!\S)') 'an absent/false switch must be omitted entirely, not rendered as a bare flag'
+    Assert-That ($argString -notmatch '-IncludePoll:') 'an absent/false switch must never render an explicit :$true/:$false value either'
     Assert-That ($argString -match '-PollMinutes "10"') 'a non-string value should still be quoted'
 } | Out-Null
 
-Invoke-Scenario -Name 'GUI: watchdog register/unregister never route through Invoke-GuiElevatable -- no elevation path exists for the watchdog' -Body {
-    # Contract B: registering/unregistering the watchdog never needs
-    # elevation any more (only conf editing/service restart and uninstall
-    # still do). A source-level regression guard, since the GUI region
+Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString renders a caller-requested -SkipLogon as a bare flag -- regression for the field bug where an explicit -Name:$false token failed to bind at all across the real -File elevation boundary' -Body {
+    # CRITICAL correctness, and the root cause of the actual field failure:
+    # powershell.exe/pwsh invoked with -File (exactly how Invoke-Elevated
+    # always re-launches this script) parses script arguments as literal,
+    # unevaluated strings. An explicit "-Name:$false"/"-Name:$true" token
+    # therefore arrives as the bare string "$false"/"$true", which
+    # PowerShell's own parameter binder cannot convert to a
+    # [SwitchParameter] -- crashing the elevated child outright ("Cannot
+    # convert value "System.String" to type SwitchParameter"). The fix is
+    # not which token to render for false vs. true; it is to never render
+    # an explicit value token AT ALL: a present switch is a BARE -Name, an
+    # absent one is OMITTED, and -SkipLogon (the parameter that actually
+    # crosses this boundary now -- see its own top-level comment) is
+    # declared with the ordinary $false default so that omission is sound
+    # in both directions with no special-casing.
+    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; SkipLogon = [switch]$true; IncludePoll = [switch]$true; PollMinutes = 10 }
+    Assert-That ($argString -match '(?<!\S)-SkipLogon(?!\S)') 'a caller-requested -SkipLogon (poll-only) must render as a bare -SkipLogon flag'
+    Assert-That ($argString -notmatch '-SkipLogon:') 'a caller-requested -SkipLogon must never render an explicit :$true value token'
+    Assert-That ($argString -match '(?<!\S)-IncludePoll(?!\S)') 'a caller-requested -IncludePoll must render as a bare -IncludePoll flag'
+    Assert-That ($argString -notmatch '-IncludePoll:') 'a caller-requested -IncludePoll must never render an explicit :$true value token'
+} | Out-Null
+
+Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString omits -SkipLogon entirely (Logon included) and carries the ORIGINAL -UserId through for a register-watchdog elevation retry' -Body {
+    # CRITICAL correctness: this command line is what the elevated child
+    # process actually receives. UserId must be the value resolved in the
+    # ORIGINAL unelevated process (see Get-ResolvedUserId / the GUI call
+    # sites), never left for the elevated child to re-derive from its own
+    # (possibly different-admin) identity.
+    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; SkipLogon = [switch]$false; IncludePoll = [switch]$false; PollMinutes = 15 }
+    Assert-That ($argString -match '-UserId "OriginalInteractiveUser"') 'the elevated re-entry command line must carry the original UserId explicitly'
+    Assert-That ($argString -notmatch '-SkipLogon(?!\S)') 'a caller that wants Logon included must have -SkipLogon omitted entirely, not rendered as a bare flag'
+    Assert-That ($argString -notmatch '-SkipLogon:') 'an absent -SkipLogon must never render an explicit :$false value token either'
+    Assert-That ($argString -notmatch '-IncludePoll(?!\S)') 'an absent -IncludePoll should be omitted entirely, not rendered as a bare flag'
+    Assert-That ($argString -notmatch '-IncludePoll:') 'an absent -IncludePoll must never render an explicit :$false value token either'
+    Assert-That ($argString -match "-Action ""register-watchdog""") 'the re-entered action should be register-watchdog'
+} | Out-Null
+
+function Invoke-E2EElevatedRegisterWatchdog {
+    # Shared plumbing for the two end-to-end scenarios below: builds the
+    # elevation-boundary argument string via the exact
+    # ConvertTo-ElevatedArgumentString/Start-Process mechanism Invoke-Elevated
+    # uses, runs it as a REAL child process, and returns the parsed JSON
+    # result array (or $null if this platform has no Start-Process at all).
+    # Start-Process -ArgumentList <single string> hands that string to the OS
+    # exactly once, unparsed -- .NET's Process class parses a single
+    # -ArgumentList/-Arguments string the same way on every platform before
+    # exec'ing the child, so this reproduces on Linux exactly what
+    # Invoke-Elevated does via Start-Process -Verb RunAs on real Windows
+    # (RunAs is the only part that is Windows-only). The child process is the
+    # real (non-dot-sourced, non-shimmed) manager.ps1, so it calls the real
+    # (Windows-only) ScheduledTasks cmdlets and is EXPECTED to report
+    # Success=$false / exit 1 on this Linux host -- that failure is not what
+    # either scenario checks. What they check is WHICH task names were even
+    # attempted (and, for Logon, whether it was a registration attempt or a
+    # reconcile-unregister), which is decided entirely by how -SkipLogon/
+    # -IncludePoll bound in the child, before any cmdlet call happens.
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][hashtable]$ExtraParameters
+    )
+
+    if (-not (Get-Command -Name 'Start-Process' -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    $sbx = New-Sbx -Label $Label
+    $stdout = Join-Path $sbx 'stdout.json'
+    $stderr = Join-Path $sbx 'stderr.txt'
+    $hostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+
+    $parameters = @{ DataDir = $sbx; UserId = 'E2EUser' } + $ExtraParameters
+    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath $script:ManagerScriptSource -Action 'register-watchdog' -Parameters $parameters
+
+    $proc = Start-Process -FilePath $hostExe -ArgumentList $argString -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    Assert-That ($null -ne $proc) 'the child process should have started'
+
+    $stdoutText = Read-TextFile $stdout
+    Assert-That (-not [string]::IsNullOrWhiteSpace($stdoutText)) "the child process should have printed its JSON result (stderr was: $(Read-TextFile $stderr))"
+
+    # $_.Name/$_.Message are cast to [string] explicitly by every caller
+    # below, and every filtered set is re-wrapped in @(...) before .Count,
+    # rather than comparing/indexing the raw ConvertFrom-Json output
+    # directly. This is the one code path in the whole suite that inspects
+    # an object which crossed a REAL JSON serialize/deserialize boundary
+    # (every other entries[0]/results[0]-style assertion elsewhere in this
+    # file inspects a live in-process object). ConvertFrom-Json's shape
+    # (bare PSCustomObject vs Object[]) for a given payload can differ
+    # between Windows PowerShell 5.1 and pwsh 7, and a property fetched off
+    # an array-shaped element enumerates across every element instead of
+    # returning one scalar -- so an unguarded "$x.Name -eq ..." or
+    # "$x.Message -eq ..." can silently evaluate to a filtered ARRAY (0 or
+    # 2+ elements) instead of a plain scalar bool. Assert-That's own
+    # [bool]$Condition parameter binder cannot convert a multi/zero-element
+    # array ("Cannot convert value "System.Object[]" to type
+    # "System.Boolean""), so that shape mismatch crashes the scenario
+    # outright instead of failing a plain assertion. Casting to [string]
+    # first costs nothing when the value is already the plain string it is
+    # supposed to be, and guarantees a scalar either way.
+    return @($stdoutText | ConvertFrom-Json)
+}
+
+Invoke-Scenario -Name 'Elevation (end-to-end): a poll-only elevation retry (-SkipLogon), run through a REAL child pwsh process via the exact ConvertTo-ElevatedArgumentString/Start-Process mechanism Invoke-Elevated uses, never attempts a Logon REGISTRATION' -Body {
+    # This is the actual regression guard for the field bug. A
+    # 'StreamConfigProfiles-Settle-Logon' entry in the output is NOT itself
+    # the bug: Register-Watchdog is a full desired-state reconciler (see
+    # there), so -SkipLogon legitimately produces a reconcile-UNREGISTER
+    # result entry for Logon too. The actual field bug this guards against
+    # (under the OLD -IncludeLogon:$false top-level surface this scenario
+    # used to exercise) was TWO-FOLD: (1) an explicit "-IncludeLogon:$false"
+    # token failed to bind AT ALL across this real -File process boundary
+    # ("Cannot convert value "System.String" to type SwitchParameter", since
+    # -File args are literal unevaluated strings), which is why the
+    # serializer omits a false/absent switch entirely instead of rendering
+    # an explicit value token; and (2), had that omission alone been the
+    # whole fix without also changing the boundary parameter's own declared
+    # default to $false, an omitted flag would have silently bound to a
+    # stale $true default in the child -- a REGISTRATION attempt instead of
+    # the reconcile-unregister this test expects. -SkipLogon replaces that
+    # fragile two-part contract with one fact that -File binds identically
+    # on every host: presence/absence of a switch whose declared default IS
+    # absence. Distinguished here by message shape: a real Register attempt
+    # on this cmdlet-less Linux host fails with a "term not recognized"
+    # message, while the reconcile-unregister no-ops successfully with a
+    # fixed message text.
+    $parsed = Invoke-E2EElevatedRegisterWatchdog -Label 'e2e-elevated-poll-only' -ExtraParameters @{ SkipLogon = [switch]$true; IncludePoll = [switch]$true; PollMinutes = 10 }
+    if ($null -eq $parsed) {
+        return
+    }
+
+    $pollEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Poll' })
+    Assert-That (@($pollEntries).Count -eq 1) "expected exactly one Poll result entry across the real process boundary, got names: $((@($parsed | ForEach-Object { [string]$_.Name })) -join ', ')"
+
+    $logonEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Logon' })
+    if (@($logonEntries).Count -gt 0) {
+        $logonMessage = [string]$logonEntries[0].Message
+        Assert-That ($logonMessage -eq 'unregistered (not requested)') "the field bug: a caller-requested -SkipLogon must never reach a REGISTRATION attempt in the elevated child (it bound to Logon-included instead, silently re-registering a task the user had just declined) -- got Logon result: Success=$($logonEntries[0].Success), Message='$logonMessage'"
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Elevation (end-to-end): the INVERSE of the poll-only case -- no -SkipLogon at all, run through a REAL child pwsh process, attempts a Logon REGISTRATION (not a reconcile-unregister)' -Body {
+    # The other half of the SkipLogon boundary contract: omitting -SkipLogon
+    # entirely (exactly what ConvertTo-ElevatedArgumentString renders when
+    # the caller's SkipLogon is [switch]$false) must bind to Logon INCLUDED
+    # in the real elevated child, on every host -- this is the direction
+    # that was never actually broken by the original field bug, but is now
+    # the one this whole redesign hinges on staying correct with no
+    # ContainsKey trick anywhere between here and the child's own top-level
+    # param block.
+    $parsed = Invoke-E2EElevatedRegisterWatchdog -Label 'e2e-elevated-logon-included' -ExtraParameters @{ SkipLogon = [switch]$false; IncludePoll = [switch]$false }
+    if ($null -eq $parsed) {
+        return
+    }
+
+    $logonEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Logon' })
+    Assert-That (@($logonEntries).Count -eq 1) "expected exactly one Logon result entry across the real process boundary, got names: $((@($parsed | ForEach-Object { [string]$_.Name })) -join ', ')"
+    $logonMessage = [string]$logonEntries[0].Message
+    Assert-That ($logonMessage -ne 'unregistered (not requested)') "an absent -SkipLogon must reach a REGISTRATION attempt in the elevated child (Logon included), not a reconcile-unregister -- got Logon result: Success=$($logonEntries[0].Success), Message='$logonMessage'"
+
+    $pollEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Poll' })
+    if (@($pollEntries).Count -gt 0) {
+        $pollMessage = [string]$pollEntries[0].Message
+        Assert-That ($pollMessage -eq 'unregistered (not requested)') "Poll was not requested (-IncludePoll omitted), so any Poll entry must be a reconcile-unregister, not a registration attempt -- got Poll result: Success=$($pollEntries[0].Success), Message='$pollMessage'"
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'GUI: watchdog register/unregister route through Invoke-GuiElevatable so an access-denied registration can retry elevated' -Body {
+    # Field bug: real Windows requires administrator APPROVAL to REGISTER a
+    # scheduled task with a logon-type trigger (AtLogOn / session-unlock),
+    # even though the task's own principal is always the calling user (see
+    # Register-Watchdog). The old "watchdog never needs elevation" routing
+    # (Invoke-GuiSafe only) left a real access-denied result with no retry
+    # path. This is a source-level regression guard, since the GUI region
     # itself is not exercised by this headless harness.
     $source = Read-TextFile $script:ManagerScriptSource
-    Assert-That (-not ($source -match "(?s)Invoke-GuiElevatable.{0,300}-Action\s+'register-watchdog'")) "register-watchdog must never be dispatched through Invoke-GuiElevatable (the elevation-retry path)"
-    Assert-That (-not ($source -match "(?s)Invoke-GuiElevatable.{0,300}-Action\s+'unregister-watchdog'")) "unregister-watchdog must never be dispatched through Invoke-GuiElevatable either"
+
+    $registerElevatableSites = @([regex]::Matches($source, "(?s)Invoke-GuiElevatable.{0,300}-Action\s+'register-watchdog'"))
+    Assert-That ($registerElevatableSites.Count -ge 2) "expected at least two GUI call sites routing register-watchdog through Invoke-GuiElevatable (wizard step 4 + main window Register/Update), found $($registerElevatableSites.Count)"
+
+    $unregisterElevatableSites = @([regex]::Matches($source, "(?s)Invoke-GuiElevatable.{0,300}-Action\s+'unregister-watchdog'"))
+    Assert-That ($unregisterElevatableSites.Count -ge 1) "expected at least one GUI call site routing unregister-watchdog through Invoke-GuiElevatable (main window Unregister All), found $($unregisterElevatableSites.Count)"
 
     $registerWatchdogGuiCallSites = @([regex]::Matches($source, 'Register-Watchdog -DataDir \$\w+ -UserId'))
     Assert-That ($registerWatchdogGuiCallSites.Count -ge 2) 'sanity: expected at least two GUI call sites for Register-Watchdog (wizard + main window)'
+} | Out-Null
+
+Invoke-Scenario -Name 'GUI: register-watchdog GUI call sites pass an explicit -UserId resolved BEFORE any elevation, not re-derived inside the elevated child' -Body {
+    # CRITICAL correctness: Invoke-Elevated's -Parameters hashtable is what
+    # the elevated re-entry's -UserId comes from. If a GUI call site instead
+    # let the elevated child fall back to Get-ResolvedUserId with no
+    # explicit UserId, an over-the-shoulder admin approval by a DIFFERENT
+    # account would silently register the task under that admin's identity
+    # instead of the interactive user who asked for protection.
+    $source = Read-TextFile $script:ManagerScriptSource
+    $registerElevatableWithUserId = @([regex]::Matches($source, "(?s)Invoke-GuiElevatable.{0,300}-Action\s+'register-watchdog'.{0,300}UserId\s*="))
+    Assert-That ($registerElevatableWithUserId.Count -ge 2) "expected every register-watchdog Invoke-GuiElevatable call site to pass UserId explicitly in -Parameters, found $($registerElevatableWithUserId.Count) that do"
+} | Out-Null
+
+Invoke-Scenario -Name 'GUI: Test-GuiWatchdogResultFailureIsElevationEligible flags exactly register-watchdog/unregister-watchdog/uninstall' -Body {
+    # register-watchdog/unregister-watchdog report a per-task failure by
+    # RETURNING Success=$false rather than throwing (see
+    # Register-Watchdog/Unregister-Watchdog), so by the time it reaches
+    # Invoke-GuiElevatable only the exception's .Message STRING survives --
+    # not a locale-independent HResult/exception type. The real field
+    # failure arrived as a LOCALIZED message ("Acceso denegado"), so these
+    # actions are special-cased by name instead of pattern-matching
+    # English text that would silently never match again.
+    Assert-That (Test-GuiWatchdogResultFailureIsElevationEligible -Action 'register-watchdog') 'register-watchdog Result failures should be elevation-eligible'
+    Assert-That (Test-GuiWatchdogResultFailureIsElevationEligible -Action 'unregister-watchdog') 'unregister-watchdog Result failures should be elevation-eligible'
+    Assert-That (-not (Test-GuiWatchdogResultFailureIsElevationEligible -Action 'register-vibepollo')) 'register-vibepollo Result failures (e.g. malformed conf JSON) are business-logic outcomes and must stay final, not elevation-eligible'
+    # uninstall now IS elevation-eligible: Uninstall-App's top-level Success
+    # is $false ONLY when the nested watchdog unregister failed (see
+    # Uninstall-App) -- never for a nested conf-edit business-logic
+    # failure -- so this can never wrongly offer to elevate-and-retry
+    # something elevation would not fix.
+    Assert-That (Test-GuiWatchdogResultFailureIsElevationEligible -Action 'uninstall') 'uninstall Result failures must be elevation-eligible now that its top-level Success reflects a failed nested watchdog unregister (see Uninstall-App)'
+} | Out-Null
+
+Invoke-Scenario -Name 'GUI: Test-GuiLooksLikeAccessDenied recognizes the E_ACCESSDENIED HRESULT even behind a localized (non-English) message' -Body {
+    # Regression test for the actual field failure: "Acceso denegado" (a
+    # Spanish Windows install's Register-ScheduledTask error) does not
+    # match any English text pattern, but the underlying HRESULT
+    # (0x80070005 / E_ACCESSDENIED, surfaced as Int32 -2147024891) is
+    # locale-independent -- this must be the primary signal, not the
+    # message text.
+    $localizedComException = New-Object System.Runtime.InteropServices.COMException('Acceso denegado', -2147024891)
+    $localizedErrorRecord = New-Object System.Management.Automation.ErrorRecord($localizedComException, 'Simulated', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
+    Assert-That (Test-GuiLooksLikeAccessDenied -ErrorRecord $localizedErrorRecord) 'a localized "Acceso denegado" message carrying HRESULT 0x80070005 should still be recognized as access-denied'
+
+    $englishTextException = New-Object System.Exception('Access is denied.')
+    $englishTextErrorRecord = New-Object System.Management.Automation.ErrorRecord($englishTextException, 'Simulated2', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+    Assert-That (Test-GuiLooksLikeAccessDenied -ErrorRecord $englishTextErrorRecord) 'plain English "Access is denied" text should still be recognized as a fallback when no HResult/type signal is present'
+
+    $unauthorizedException = New-Object System.UnauthorizedAccessException('some message')
+    $unauthorizedErrorRecord = New-Object System.Management.Automation.ErrorRecord($unauthorizedException, 'Simulated3', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
+    Assert-That (Test-GuiLooksLikeAccessDenied -ErrorRecord $unauthorizedErrorRecord) 'a UnauthorizedAccessException should be recognized regardless of its message text'
+
+    $unrelatedException = New-Object System.Exception('Algo salio mal por otra razon')
+    $unrelatedErrorRecord = New-Object System.Management.Automation.ErrorRecord($unrelatedException, 'Simulated4', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+    Assert-That (-not (Test-GuiLooksLikeAccessDenied -ErrorRecord $unrelatedErrorRecord)) 'an unrelated exception with no matching HResult/type/text must not be misdetected as access-denied'
+} | Out-Null
+
+Invoke-Scenario -Name 'GUI: Invoke-GuiElevationRetry skips the confirm/elevate dance entirely when this process is already running as administrator' -Body {
+    # An already-elevated GUI process (e.g. Install.bat run as
+    # administrator) offering "Retry elevated?" launches a SECOND elevated
+    # process via Start-Process -Verb RunAs, which always shows a fresh UAC
+    # consent prompt regardless of the caller's own elevation, only to hit
+    # the exact same failure again -- this process's lack of permissions
+    # was never the actual cause. Test-IsAdmin=$true must short-circuit
+    # straight to reporting the original failure, with no confirm dialog
+    # (which would need real WinForms, unavailable in this headless
+    # harness) and no attempted re-elevation.
+    #
+    # `script:` scope on the override is required, not incidental: a bare
+    # "function Test-IsAdmin {...}" here would define it in this scenario
+    # body's own child scope, invisible to Invoke-GuiElevationRetry (which
+    # resolves the name starting from ITS OWN definition scope, i.e. the
+    # dot-sourced script scope) -- exactly like $script:UnregisterShouldThrowFor
+    # above needs the same explicit scope to reach the shimmed cmdlet wrappers.
+    function script:Test-IsAdmin { return $true }
+    try {
+        $result = Invoke-GuiElevationRetry -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{} -FailureMessage 'simulated non-permission failure'
+        Assert-That (-not $result.Success) 'an already-elevated retry attempt should report failure, not silently succeed'
+        Assert-That (-not $result.Elevated) 'an already-elevated retry must not report Elevated=$true -- it never launched a second elevated process'
+        Assert-That ($result.ErrorMessage -match [regex]::Escape('simulated non-permission failure')) 'the original failure message should still be surfaced'
+        Assert-That ($result.ErrorMessage -match '(?i)already running as administrator') 'the message should explain why elevating again was skipped'
+    }
+    finally {
+        function script:Test-IsAdmin { return $false }
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Resolvers: Get-ResolvedUserId falls back to DOMAIN\User when USERDOMAIN/USERNAME are set and no SID is available' -Body {
+    # Get-CurrentWindowsUserSid is shimmed (above) to always return $null,
+    # forcing Get-ResolvedUserId through to its next-best signal on EVERY
+    # platform this runs on -- including real Windows, where a SID is
+    # otherwise always genuinely available and this fallback branch could
+    # never be reached at all without the shim (the previous, unshimmed
+    # version of this test relied on WindowsIdentity simply being
+    # unavailable under pwsh on Linux, which made it pass here but fail on
+    # real Windows CI, where a SID IS available and the function correctly
+    # returns it instead of this fallback). This is exactly the ambiguity
+    # the SID preference exists to avoid on real Windows: a bare name is
+    # ambiguous on a domain-joined machine, so "DOMAIN\User" must be
+    # preferred over a bare name whenever both environment variables are
+    # actually available.
+    $savedDomain = $env:USERDOMAIN
+    $savedName = $env:USERNAME
+    try {
+        $env:USERDOMAIN = 'TESTDOMAIN'
+        $env:USERNAME = 'TestUser'
+        Assert-That ((Get-ResolvedUserId -UserId '') -eq 'TESTDOMAIN\TestUser') 'with both USERDOMAIN and USERNAME set (and no SID available), Get-ResolvedUserId should prefer the DOMAIN\User form over a bare name'
+
+        $env:USERDOMAIN = ''
+        Assert-That ((Get-ResolvedUserId -UserId '') -eq 'TestUser') 'with USERDOMAIN blank, Get-ResolvedUserId should fall back to the bare USERNAME'
+    }
+    finally {
+        $env:USERDOMAIN = $savedDomain
+        $env:USERNAME = $savedName
+    }
 } | Out-Null
 
 Invoke-Scenario -Name 'Elevation: manager.ps1 declares PositionalBinding = $false' -Body {
@@ -817,6 +1241,31 @@ Invoke-Scenario -Name 'Dispatch: register-watchdog and unregister-watchdog round
     Assert-That (@($unregResult).Count -eq 3) 'unregister-watchdog dispatch should report all three well-known tasks'
 } | Out-Null
 
+Invoke-Scenario -Name 'Dispatch: -UserId passed to the register-watchdog CLI action flows all the way into the registered task principal' -Body {
+    # CRITICAL correctness: this is exactly the value the elevated re-entry
+    # relies on (see Invoke-Elevated / the GUI call sites) to register the
+    # Logon task under the ORIGINAL interactive user rather than whatever
+    # identity the elevated process itself happens to run as.
+    $script:WatchdogCalls.Clear()
+    Invoke-ManagerAction -Action 'register-watchdog' -ScriptDir $script:RepoRoot -DataDir '/fake/data' -UserId 'OriginalInteractiveUser' -IncludePoll -PollMinutes 10 | Out-Null
+
+    $logonCall = @($script:WatchdogCalls | Where-Object { $_.Op -eq 'Register' -and $_.Name -eq 'StreamConfigProfiles-Settle-Logon' })[0]
+    $pollCall = @($script:WatchdogCalls | Where-Object { $_.Op -eq 'Register' -and $_.Name -eq 'StreamConfigProfiles-Settle-Poll' })[0]
+    Assert-That ($null -ne $logonCall) 'sanity: the Logon task should have been registered'
+    Assert-That ($logonCall.UserId -eq 'OriginalInteractiveUser') "the Logon task principal's UserId should be the -UserId passed to the CLI action, got '$($logonCall.UserId)'"
+    Assert-That ($pollCall.UserId -eq 'OriginalInteractiveUser') "the Poll task principal's UserId should be the -UserId passed to the CLI action, got '$($pollCall.UserId)'"
+} | Out-Null
+
+Invoke-Scenario -Name 'Dispatch: register-watchdog -IncludeLogon:$false dispatches a poll-only registration with no Logon attempt' -Body {
+    $script:WatchdogCalls.Clear()
+    $result = Invoke-ManagerAction -Action 'register-watchdog' -ScriptDir $script:RepoRoot -DataDir '/fake/data' -UserId 'DispatchUser' -IncludeLogon:$false -IncludePoll -PollMinutes 10
+    Assert-That (-not (Test-ManagerResultIndicatesFailure -Result $result)) 'poll-only register-watchdog dispatch should succeed against the shim'
+
+    $registerCalls = @($script:WatchdogCalls | Where-Object { $_.Op -eq 'Register' })
+    Assert-That (@($registerCalls).Count -eq 1) "expected exactly 1 Register call (Poll only), got $(@($registerCalls).Count)"
+    Assert-That ($registerCalls[0].Name -eq 'StreamConfigProfiles-Settle-Poll') 'the only task dispatched should be Poll'
+} | Out-Null
+
 Invoke-Scenario -Name 'Dispatch: uninstall action tears down a dispatched install' -Body {
     $sbx = New-Sbx -Label 'dispatch-uninstall'
     $programDir = Join-Path $sbx 'program'
@@ -827,6 +1276,72 @@ Invoke-Scenario -Name 'Dispatch: uninstall action tears down a dispatched instal
 
     Assert-That (-not (Test-Path -LiteralPath $programDir)) 'dispatched uninstall should remove PROGRAM'
     Assert-That (-not (Test-ManagerResultIndicatesFailure -Result $result)) 'a clean uninstall should not look like a failure'
+} | Out-Null
+
+Invoke-Scenario -Name 'Uninstall-App: a failed nested watchdog unregister surfaces at the TOP level as Success=$false' -Body {
+    # Regression: $summary used to carry no top-level Success property at
+    # all, so Test-ManagerResultIndicatesFailure (which only inspects the
+    # top level of @($Result) by design) could not see a Success=$false
+    # buried inside WatchdogUnregistered. That made the GUI show the
+    # unconditional "disconnected and uninstalled" success text, the
+    # elevated CLI re-entry exit 0, and uninstall could never be judged
+    # elevation-eligible -- all while PROGRAM had already been deleted and
+    # an admin-owned watchdog task was left behind, still pointed at DATA.
+    $sbx = New-Sbx -Label 'uninstall-failed-watchdog'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $script:UnregisterShouldThrowFor = @('StreamConfigProfiles-Settle-Logon')
+    try {
+        $script:WatchdogCalls.Clear()
+        $summary = Uninstall-App -ProgramDir $programDir -DataDir $dataDir
+
+        Assert-That ($summary.PSObject.Properties.Match('Success').Count -gt 0) 'Uninstall-App summary must carry a top-level Success property'
+        Assert-That (-not $summary.Success) 'a denied watchdog unregister nested inside WatchdogUnregistered must flip the top-level Success to $false'
+        Assert-That (Test-ManagerResultIndicatesFailure -Result $summary) 'Test-ManagerResultIndicatesFailure must now see the failure via the top-level Success property'
+    }
+    finally {
+        $script:UnregisterShouldThrowFor = @()
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Uninstall-App: a nested conf-edit (business-logic) failure does NOT flip the top-level Success -- only a watchdog unregister failure does' -Body {
+    # Deliberate scope limit (see Uninstall-App / Test-GuiWatchdogResultFailure-
+    # IsElevationEligible): a malformed-conf-JSON failure is the same
+    # business-logic outcome register-vibepollo reports elsewhere. Elevating
+    # would not fix it, so it must stay a final Result-shaped failure nested
+    # in ConfEntryRemoved, never flip the top-level Success that uninstall's
+    # elevation-eligibility now keys off of.
+    $sbx = New-Sbx -Label 'uninstall-malformed-conf'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $confPath = Join-Path $sbx 'sunshine.conf'
+    New-ConfFixture -Path $confPath -Content "global_prep_cmd = {this is not valid json`n"
+
+    $script:WatchdogCalls.Clear()
+    $summary = Uninstall-App -ProgramDir $programDir -DataDir $dataDir -ConfPath $confPath
+
+    Assert-That (-not $summary.ConfEntryRemoved.Success) 'sanity: the malformed conf edit should itself report failure'
+    Assert-That ($summary.Success) 'a nested conf-edit failure must NOT flip the top-level Success -- it is a business-logic outcome, not a permissions problem'
+} | Out-Null
+
+Invoke-Scenario -Name 'Dispatch: uninstall action exits non-zero (via Test-ManagerResultIndicatesFailure) when the nested watchdog unregister fails' -Body {
+    $sbx = New-Sbx -Label 'dispatch-uninstall-failed-watchdog'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    Invoke-ManagerAction -Action 'install' -ScriptDir $script:RepoRoot -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource | Out-Null
+
+    $script:UnregisterShouldThrowFor = @('StreamConfigProfiles-Settle-Poll')
+    try {
+        $result = Invoke-ManagerAction -Action 'uninstall' -ScriptDir $script:RepoRoot -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource
+        Assert-That (Test-ManagerResultIndicatesFailure -Result $result) 'a dispatched uninstall with a denied watchdog unregister must be visible to Test-ManagerResultIndicatesFailure (this is what the CLI entry point/elevated re-entry gate their exit code on)'
+    }
+    finally {
+        $script:UnregisterShouldThrowFor = @()
+    }
 } | Out-Null
 
 # ===========================================================================
@@ -937,6 +1452,851 @@ Invoke-Scenario -Name 'PathsTxt: Remove-PathsTxtLine removes only the matching p
     Assert-That ($content -match [regex]::Escape('# keep me')) 'comment should survive removal'
     Assert-That ($content -match [regex]::Escape('C:\Keep\config.ini')) 'the other path should survive'
     Assert-That (-not ($content -match [regex]::Escape('C:\Remove\config.ini'))) 'the targeted path should be gone'
+} | Out-Null
+
+# ===========================================================================
+# Find-HostConf: ProgramW6432 probing + wildcard fallback (field bug)
+# ===========================================================================
+
+function Backup-ProgramFilesEnv {
+    return [PSCustomObject]@{
+        ProgramFiles    = $env:ProgramFiles
+        ProgramW6432    = $env:ProgramW6432
+        ProgramFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    }
+}
+
+function Restore-ProgramFilesEnv {
+    param($Backup)
+    $env:ProgramFiles = $Backup.ProgramFiles
+    $env:ProgramW6432 = $Backup.ProgramW6432
+    [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $Backup.ProgramFilesX86)
+}
+
+Invoke-Scenario -Name 'Find-HostConf: Get-HostConfRoots probes ProgramW6432 alongside ProgramFiles/ProgramFiles(x86), de-duplicated' -Body {
+    $saved = Backup-ProgramFilesEnv
+    try {
+        $env:ProgramFiles = 'C:\PF32Path'
+        $env:ProgramW6432 = 'C:\TrueProgramFiles'
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', 'C:\PF32Path')
+
+        $roots = @(Get-HostConfRoots)
+        Assert-That ($roots -contains 'C:\TrueProgramFiles') 'Get-HostConfRoots must include ProgramW6432 -- the field fix for a 32-bit process on 64-bit Windows hiding the real Program Files'
+        Assert-That ($roots -contains 'C:\PF32Path') 'Get-HostConfRoots must still include ProgramFiles'
+        Assert-That (@($roots | Where-Object { $_ -eq 'C:\PF32Path' }).Count -eq 1) 'a root equal to both ProgramFiles and ProgramFiles(x86) must be de-duplicated, not probed twice'
+    }
+    finally {
+        Restore-ProgramFilesEnv -Backup $saved
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConf: Get-HostConfCandidatePaths includes a path built from ProgramW6432' -Body {
+    # Plain (non "C:\"-drive-letter) fake roots: Join-Path on a
+    # non-Windows PowerShell host tries to resolve a leading "C:" against
+    # a real PSDrive named C and throws "Cannot find drive" when none
+    # exists (this test suite runs on Linux/pwsh in CI) -- an
+    # implementation/test-host detail with no bearing on what this
+    # scenario actually verifies (that ProgramW6432 feeds a candidate).
+    $saved = Backup-ProgramFilesEnv
+    try {
+        $env:ProgramFiles = '/fake/PF32Path'
+        $env:ProgramW6432 = '/fake/TrueProgramFiles'
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $null)
+
+        $candidates = Get-HostConfCandidatePaths
+        $expected = Join-Path (Join-Path (Join-Path '/fake/TrueProgramFiles' 'Apollo') 'config') 'apollo.conf'
+        Assert-That ($candidates -contains $expected) "expected a ProgramW6432-rooted candidate ($expected) in the candidate list"
+    }
+    finally {
+        Restore-ProgramFilesEnv -Backup $saved
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConf: a real conf under ProgramW6432 is found even when ProgramFiles points elsewhere (WOW64 field bug)' -Body {
+    # Reproduces the actual field scenario: a 32-bit Windows PowerShell
+    # process on 64-bit Windows sees $env:ProgramFiles pointing at
+    # "Program Files (x86)", but ProgramW6432 still names the true 64-bit
+    # Program Files where the real install lives.
+    $sbxWow64 = Join-Path (New-Sbx -Label 'find-conf-w6432') 'Program Files'
+    $sbxX86 = Join-Path (Split-Path -Path $sbxWow64 -Parent) 'Program Files (x86)'
+    $confPath = Join-Path (Join-Path (Join-Path $sbxWow64 'Apollo') 'config') 'apollo.conf'
+    Write-TextFile -Path $confPath -Content 'sunshine_name = RealInstall'
+
+    $saved = Backup-ProgramFilesEnv
+    try {
+        $env:ProgramFiles = $sbxX86
+        $env:ProgramW6432 = $sbxWow64
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $sbxX86)
+
+        $found = Find-HostConf
+        Assert-That ($found -eq $confPath) "expected Find-HostConf to find the ProgramW6432-rooted conf ($confPath), got: $found"
+    }
+    finally {
+        Restore-ProgramFilesEnv -Backup $saved
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConfByWildcard: a single unknown-name conf file in a known appDir/config directory wins' -Body {
+    $sbx = New-Sbx -Label 'wildcard-single-unknown'
+    $confPath = Join-Path (Join-Path (Join-Path $sbx 'Vibepollo') 'config') 'my-custom-name.conf'
+    Write-TextFile -Path $confPath -Content 'k = v'
+
+    $found = Find-HostConfByWildcard -Roots @($sbx)
+    Assert-That ($found -eq $confPath) "expected the single unknown-name conf to win, got: $found"
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConfByWildcard: multiple confs prefer a known name over an unrecognized one, even if the unknown one is newer' -Body {
+    $sbx = New-Sbx -Label 'wildcard-prefer-known'
+    $configDir = Join-Path (Join-Path $sbx 'Apollo') 'config'
+    $knownPath = Join-Path $configDir 'apollo.conf'
+    $unknownPath = Join-Path $configDir 'leftover-backup.conf'
+    Write-TextFile -Path $knownPath -Content 'k = v'
+    Write-TextFile -Path $unknownPath -Content 'k = v'
+
+    # Make the unknown one strictly newer, so a naive newest-wins policy
+    # (with no known-name preference) would pick the wrong file.
+    (Get-Item -LiteralPath $unknownPath).LastWriteTime = (Get-Date).AddMinutes(10)
+    (Get-Item -LiteralPath $knownPath).LastWriteTime = (Get-Date).AddMinutes(-10)
+
+    $found = Find-HostConfByWildcard -Roots @($sbx)
+    Assert-That ($found -eq $knownPath) "expected the known-name conf ($knownPath) to be preferred over a newer unrecognized one, got: $found"
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConfByWildcard: multiple unrecognized confs fall back to newest LastWriteTime' -Body {
+    $sbx = New-Sbx -Label 'wildcard-newest-wins'
+    $configDir = Join-Path (Join-Path $sbx 'Sunshine') 'config'
+    $olderPath = Join-Path $configDir 'old.conf'
+    $newerPath = Join-Path $configDir 'new.conf'
+    Write-TextFile -Path $olderPath -Content 'k = v'
+    Write-TextFile -Path $newerPath -Content 'k = v'
+    (Get-Item -LiteralPath $olderPath).LastWriteTime = (Get-Date).AddMinutes(-10)
+    (Get-Item -LiteralPath $newerPath).LastWriteTime = (Get-Date)
+
+    $found = Find-HostConfByWildcard -Roots @($sbx)
+    Assert-That ($found -eq $newerPath) "expected the newest unrecognized conf ($newerPath) to win, got: $found"
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConfByWildcard: returns $null when no config directory exists, and never throws on an empty Roots array' -Body {
+    $sbx = New-Sbx -Label 'wildcard-nothing-there'
+    $found = Find-HostConfByWildcard -Roots @($sbx)
+    Assert-That ($null -eq $found) 'no appDir/config directory exists under the given root, so this should return $null'
+
+    $foundEmpty = Find-HostConfByWildcard -Roots @()
+    Assert-That ($null -eq $foundEmpty) 'an empty Roots array is a legitimate input (e.g. no Program Files env vars set at all) and must not throw'
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConf: falls back to the wildcard scan when no known-name candidate exists anywhere' -Body {
+    $sbx = New-Sbx -Label 'find-conf-wildcard-fallback'
+    $confPath = Join-Path (Join-Path (Join-Path $sbx 'Apollo') 'config') 'renamed-install.conf'
+    Write-TextFile -Path $confPath -Content 'sunshine_name = RenamedInstall'
+
+    $saved = Backup-ProgramFilesEnv
+    try {
+        $env:ProgramFiles = $sbx
+        $env:ProgramW6432 = $sbx
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $null)
+
+        $found = Find-HostConf
+        Assert-That ($found -eq $confPath) "expected Find-HostConf's wildcard fallback to find the renamed conf ($confPath), got: $found"
+    }
+    finally {
+        Restore-ProgramFilesEnv -Backup $saved
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConf: a known-name conf is still found deterministically, never falling through to the wildcard scan unnecessarily' -Body {
+    # Regression guard: the wildcard fallback must never change behavior
+    # for the common case of a standard install using a known filename.
+    $sbx = New-Sbx -Label 'find-conf-deterministic-still-wins'
+    $confPath = Join-Path (Join-Path (Join-Path $sbx 'Sunshine') 'config') 'sunshine.conf'
+    Write-TextFile -Path $confPath -Content 'sunshine_name = Standard'
+    # Plant a decoy unknown-name file that a buggy implementation might
+    # pick via the wildcard path instead.
+    $decoyPath = Join-Path (Join-Path (Join-Path $sbx 'Sunshine') 'config') 'zzz-decoy.conf'
+    Write-TextFile -Path $decoyPath -Content 'decoy'
+    (Get-Item -LiteralPath $decoyPath).LastWriteTime = (Get-Date).AddMinutes(10)
+
+    $saved = Backup-ProgramFilesEnv
+    try {
+        $env:ProgramFiles = $sbx
+        $env:ProgramW6432 = $sbx
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $null)
+
+        $found = Find-HostConf
+        Assert-That ($found -eq $confPath) "the known-name conf should win deterministically, got: $found"
+    }
+    finally {
+        Restore-ProgramFilesEnv -Backup $saved
+    }
+} | Out-Null
+
+# ===========================================================================
+# Vibepollo connection state (wizard gating) -- BUG B
+# ===========================================================================
+
+Invoke-Scenario -Name 'Vibepollo connect: Invoke-VibepolloConnectAction succeeds against a real conf -- this Success=$true is the ONLY trigger Show-WizardVibepolloStep uses to set State.VibepolloConnected' -Body {
+    # Invoke-GuiElevatable's happy path (no failure, no exception) never
+    # touches System.Windows.Forms, so this is genuinely exercisable
+    # headlessly on this Linux harness -- it drives the exact same
+    # function both Show-WizardVibepolloStep's Connect button and the Main
+    # Window's Connect/Reconnect... dialog call.
+    $sbx = New-Sbx -Label 'vibepollo-connect-action-success'
+    $confPath = Join-Path $sbx 'sunshine.conf'
+    New-ConfFixture -Path $confPath -Content "k = v`n"
+    $dataDir = Join-Path $sbx 'data'
+
+    $outcome = Invoke-VibepolloConnectAction -ManagerScriptPath $script:ManagerScriptSource -ConfPath $confPath -DataDir $dataDir
+    Assert-That $outcome.Success 'a clean conf should connect successfully'
+
+    $enginePath = Join-Path $dataDir 'sync-configs.ps1'
+    $entries = (Get-PrepCommandEntries -ConfPath $confPath).Entries
+    $ours = @($entries | Where-Object { Test-PrepCommandEntryIsOurs -Entry $_ -EnginePath $enginePath })
+    Assert-That (@($ours).Count -eq 1) 'our entry should actually be present in the conf after a successful connect'
+} | Out-Null
+
+Invoke-Scenario -Name 'Vibepollo connect: Show-FirstRunWizard initializes State.VibepolloConnected to $false' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    Assert-That ($source -match 'VibepolloConnected\s*=\s*\$false') 'the wizard state hashtable should initialize VibepolloConnected to $false'
+} | Out-Null
+
+Invoke-Scenario -Name 'Vibepollo connect: State.VibepolloConnected is set to $true only inside the Connect handler''s Success branch, never unconditionally' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $stepBody = [regex]::Match($source, '(?s)function Show-WizardVibepolloStep \{.*?\n\}\r?\n\r?\nfunction Show-WizardWatchdogStep')
+    Assert-That $stepBody.Success 'sanity: should be able to locate Show-WizardVibepolloStep''s body'
+
+    $setSites = @([regex]::Matches($stepBody.Value, 'State\.VibepolloConnected\s*=\s*\$true'))
+    Assert-That (@($setSites).Count -eq 1) "expected exactly one site setting State.VibepolloConnected = `$true, found $(@($setSites).Count)"
+
+    # It must be inside the addOutcome.Success branch: the nearest
+    # preceding "if ($addOutcome.Success)" (or equivalent) must appear
+    # closer than any addOutcome.Success -eq $false-shaped alternative.
+    $successBranchIndex = $stepBody.Value.IndexOf('if ($addOutcome.Success)')
+    $setIndex = $stepBody.Value.IndexOf('$State.VibepolloConnected = $true')
+    Assert-That ($successBranchIndex -ge 0 -and $setIndex -gt $successBranchIndex) 'VibepolloConnected must be set to $true after (inside) the addOutcome.Success check, not unconditionally on Connect being clicked'
+} | Out-Null
+
+Invoke-Scenario -Name 'Vibepollo connect: the Next button warns and requires explicit confirmation before proceeding while not connected' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $stepBody = [regex]::Match($source, '(?s)function Show-WizardVibepolloStep \{.*?\n\}\r?\n\r?\nfunction Show-WizardWatchdogStep')
+    Assert-That $stepBody.Success 'sanity: should be able to locate Show-WizardVibepolloStep''s body'
+
+    $nextHandler = [regex]::Match($stepBody.Value, '(?s)\$btnNext\.Add_Click\(\{.*?\}\)')
+    Assert-That $nextHandler.Success 'sanity: should be able to locate the Next button''s click handler'
+
+    Assert-That ($nextHandler.Value -match [regex]::Escape('$State.VibepolloConnected')) 'the Next handler should gate on State.VibepolloConnected'
+    Assert-That ($nextHandler.Value -match 'Show-GuiConfirm') 'the Next handler should ask for confirmation via Show-GuiConfirm, not just a MessageBox notice'
+    Assert-That ($nextHandler.Value -match [regex]::Escape('You have not connected to Vibepollo/Apollo')) 'the confirmation text should match the specified warning'
+    Assert-That ($nextHandler.Value -match [regex]::Escape('Continue anyway?')) 'the confirmation text should end with the specified question'
+    Assert-That ($nextHandler.Value -match '(?s)if\s*\(-not\s*\$proceedAnyway\)\s*\{\s*return') 'declining the confirmation must actually stop Next from closing the dialog (an early return), not just show a warning and proceed regardless'
+} | Out-Null
+
+Invoke-Scenario -Name 'Vibepollo connect: Show-MainWindow exposes a Sync-VibepolloStatus function and a Connect/Reconnect... button wired to Show-VibepolloConnectDialog' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    Assert-That ($source -match 'function Sync-VibepolloStatus') 'Show-MainWindow should define Sync-VibepolloStatus'
+    Assert-That ($source -match [regex]::Escape("New-GuiButton -Text 'Connect/Reconnect...'")) 'the main window should have a Connect/Reconnect... button'
+    Assert-That ($source -match '(?s)btnConnectVibepollo\.Add_Click\(\{.*?Show-VibepolloConnectDialog') 'the Connect/Reconnect... button should invoke Show-VibepolloConnectDialog'
+} | Out-Null
+
+Invoke-Scenario -Name 'Vibepollo connect: Show-VibepolloConnectDialog and Show-WizardVibepolloStep''s Connect handler share Invoke-VibepolloConnectAction (one code path, not two copies)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $callSites = @([regex]::Matches($source, 'Invoke-VibepolloConnectAction\s+-ManagerScriptPath'))
+    Assert-That (@($callSites).Count -ge 2) "expected at least two call sites sharing Invoke-VibepolloConnectAction (wizard step + main window dialog), found $(@($callSites).Count)"
+} | Out-Null
+
+# ===========================================================================
+# Shortcuts: definition builder, paths, create (shimmed), remove
+# ===========================================================================
+
+Invoke-Scenario -Name 'Shortcuts: Get-ManagerShortcutDefinition builds the expected target/arguments/working directory, quoting a PROGRAM path with spaces' -Body {
+    # Plain (non "C:\"-drive-letter) fake paths: Join-Path on a
+    # non-Windows PowerShell host tries to resolve a leading "C:" against
+    # a real PSDrive named C and throws "Cannot find drive" when none
+    # exists (this test suite runs on Linux/pwsh in CI) -- an
+    # implementation/test-host detail with no bearing on what this
+    # scenario actually verifies (quoting a spaced path correctly).
+    $programDir = '/fake/Users/John Doe/AppData/Local/Programs/stream-config-profiles'
+    $def = Get-ManagerShortcutDefinition -ProgramDir $programDir -SystemRoot '/fake/Windows'
+
+    $expectedExe = Get-WindowsPowerShellExePath -SystemRoot '/fake/Windows'
+    $expectedManagerPath = Join-Path $programDir 'manager.ps1'
+
+    Assert-That ($def.Name -eq 'Stream Config Profiles') "expected shortcut Name 'Stream Config Profiles', got '$($def.Name)'"
+    Assert-That ($def.TargetPath -eq $expectedExe) "expected TargetPath '$expectedExe', got '$($def.TargetPath)'"
+    Assert-That ($def.WorkingDirectory -eq $programDir) 'WorkingDirectory should be PROGRAM, so a relative reference from manager.ps1 still resolves'
+    Assert-That ($def.Arguments -match [regex]::Escape('-NoProfile')) 'Arguments should include -NoProfile'
+    Assert-That ($def.Arguments -match [regex]::Escape('-ExecutionPolicy Bypass')) 'Arguments should include -ExecutionPolicy Bypass'
+    Assert-That ($def.Arguments -match [regex]::Escape('-File "' + $expectedManagerPath + '"')) 'Arguments should include a properly quoted -File "<PROGRAM>\manager.ps1" (the path contains a space and must survive as one token)'
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: Get-ManagerShortcutPaths builds Desktop/StartMenu paths from given folders, and degrades to $null when a folder is unavailable' -Body {
+    $sbx = New-Sbx -Label 'shortcut-paths'
+    $desktopDir = Join-Path $sbx 'Desktop'
+    $programsDir = Join-Path $sbx 'Programs'
+
+    $paths = Get-ManagerShortcutPaths -DesktopDir $desktopDir -ProgramsDir $programsDir
+    Assert-That ($paths.Desktop -eq (Join-Path $desktopDir 'Stream Config Profiles.lnk')) "unexpected Desktop path: $($paths.Desktop)"
+    Assert-That ($paths.StartMenu -eq (Join-Path $programsDir 'Stream Config Profiles.lnk')) "unexpected StartMenu path: $($paths.StartMenu)"
+
+    $blankPaths = Get-ManagerShortcutPaths -DesktopDir '' -ProgramsDir ''
+    Assert-That ($null -eq $blankPaths.Desktop) 'an unavailable Desktop folder (blank, e.g. this Linux host) should degrade to $null, not a bogus relative path'
+    Assert-That ($null -eq $blankPaths.StartMenu) 'an unavailable Programs folder should degrade to $null'
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: New-ManagerShortcut creates only the Start Menu shortcut by default (Desktop opt-in, off)' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'shortcut-default'
+    $programDir = Join-Path $sbx 'program'
+    $desktopDir = Join-Path $sbx 'Desktop'
+    $programsDir = Join-Path $sbx 'Programs'
+
+    $results = New-ManagerShortcut -ProgramDir $programDir -DesktopDir $desktopDir -ProgramsDir $programsDir
+    Assert-That ($script:ShortcutCalls.Count -eq 1) "expected exactly 1 shortcut creation call (Start Menu only) by default, got $($script:ShortcutCalls.Count)"
+    Assert-That ($script:ShortcutCalls[0].ShortcutPath -eq (Join-Path $programsDir 'Stream Config Profiles.lnk')) 'the default shortcut created should be the Start Menu one'
+    Assert-That (@($results | Where-Object { $_.Location -eq 'StartMenu' -and $_.Success }).Count -eq 1) 'the result set should report a successful StartMenu creation'
+    Assert-That (@($results | Where-Object { $_.Location -eq 'Desktop' }).Count -eq 0) 'Desktop must not even be attempted when not requested'
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: New-ManagerShortcut -Desktop also creates the Desktop shortcut, with the correct definition passed through' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'shortcut-both'
+    $programDir = Join-Path $sbx 'program'
+    $desktopDir = Join-Path $sbx 'Desktop'
+    $programsDir = Join-Path $sbx 'Programs'
+
+    $results = New-ManagerShortcut -ProgramDir $programDir -StartMenu -Desktop -DesktopDir $desktopDir -ProgramsDir $programsDir
+    Assert-That ($script:ShortcutCalls.Count -eq 2) "expected 2 shortcut creation calls (Start Menu + Desktop), got $($script:ShortcutCalls.Count)"
+
+    $desktopCall = @($script:ShortcutCalls | Where-Object { $_.ShortcutPath -eq (Join-Path $desktopDir 'Stream Config Profiles.lnk') })[0]
+    Assert-That ($null -ne $desktopCall) 'a Desktop shortcut creation call should have been made'
+    Assert-That ($desktopCall.Definition.WorkingDirectory -eq $programDir) 'the Definition passed to New-ShortcutFile should carry the correct WorkingDirectory'
+
+    Assert-That (@($results | Where-Object { -not $_.Success }).Count -eq 0) 'both locations should report success against the shim'
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: New-ManagerShortcut reports a per-location failure without throwing or blocking the other location' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'shortcut-partial-failure'
+    $programDir = Join-Path $sbx 'program'
+    $desktopDir = Join-Path $sbx 'Desktop'
+    $programsDir = Join-Path $sbx 'Programs'
+    $startMenuPath = Join-Path $programsDir 'Stream Config Profiles.lnk'
+
+    $script:ShortcutCreateShouldThrowFor = @($startMenuPath)
+    try {
+        $results = New-ManagerShortcut -ProgramDir $programDir -StartMenu -Desktop -DesktopDir $desktopDir -ProgramsDir $programsDir
+        $startMenuResult = @($results | Where-Object { $_.Location -eq 'StartMenu' })[0]
+        $desktopResult = @($results | Where-Object { $_.Location -eq 'Desktop' })[0]
+        Assert-That (-not $startMenuResult.Success) 'the Start Menu location should report the simulated failure'
+        Assert-That ($desktopResult.Success) 'the Desktop location must still succeed -- one location failing must never block the other'
+    }
+    finally {
+        $script:ShortcutCreateShouldThrowFor = @()
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: New-ManagerShortcut treats an unavailable folder as a reported (not thrown) per-location failure' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'shortcut-unavailable-folder'
+    $programDir = Join-Path $sbx 'program'
+
+    $results = New-ManagerShortcut -ProgramDir $programDir -StartMenu -Desktop -DesktopDir '' -ProgramsDir ''
+    Assert-That ($script:ShortcutCalls.Count -eq 0) 'New-ShortcutFile must never even be called when the target folder is unavailable'
+    Assert-That (@($results | Where-Object { -not $_.Success }).Count -eq 2) 'both locations should report failure when their folders are unavailable'
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: Uninstall-App removes existing Desktop and Start Menu shortcut files (best-effort), reporting them, without needing COM' -Body {
+    $sbx = New-Sbx -Label 'uninstall-removes-shortcuts'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    $desktopDir = Join-Path $sbx 'Desktop'
+    $programsDir = Join-Path $sbx 'Programs'
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $desktopShortcut = Join-Path $desktopDir 'Stream Config Profiles.lnk'
+    $startMenuShortcut = Join-Path $programsDir 'Stream Config Profiles.lnk'
+    Write-TextFile -Path $desktopShortcut -Content 'FAKE-LNK-DESKTOP'
+    Write-TextFile -Path $startMenuShortcut -Content 'FAKE-LNK-STARTMENU'
+
+    $summary = Uninstall-App -ProgramDir $programDir -DataDir $dataDir -ConfPath $null -DesktopDir $desktopDir -ProgramsDir $programsDir
+
+    Assert-That (-not (Test-Path -LiteralPath $desktopShortcut)) 'the Desktop shortcut file should actually be deleted'
+    Assert-That (-not (Test-Path -LiteralPath $startMenuShortcut)) 'the Start Menu shortcut file should actually be deleted'
+
+    $desktopResult = @($summary.ShortcutsRemoved | Where-Object { $_.Location -eq 'Desktop' })[0]
+    $startMenuResult = @($summary.ShortcutsRemoved | Where-Object { $_.Location -eq 'StartMenu' })[0]
+    Assert-That ($desktopResult.Success -and $desktopResult.Message -eq 'removed') "expected Desktop removal Message 'removed', got Success=$($desktopResult.Success) Message='$($desktopResult.Message)'"
+    Assert-That ($startMenuResult.Success -and $startMenuResult.Message -eq 'removed') "expected StartMenu removal Message 'removed', got Success=$($startMenuResult.Success) Message='$($startMenuResult.Message)'"
+    Assert-That $summary.Success 'shortcut removal must never flip the top-level uninstall Success -- it is best-effort clutter cleanup, not a permissions hazard'
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: Uninstall-App reports "not present" (still Success) when no shortcut file exists at either location' -Body {
+    $sbx = New-Sbx -Label 'uninstall-no-shortcuts-present'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    $desktopDir = Join-Path $sbx 'Desktop'
+    $programsDir = Join-Path $sbx 'Programs'
+    New-Item -ItemType Directory -Path $desktopDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $programsDir -Force | Out-Null
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $summary = Uninstall-App -ProgramDir $programDir -DataDir $dataDir -ConfPath $null -DesktopDir $desktopDir -ProgramsDir $programsDir
+
+    $desktopResult = @($summary.ShortcutsRemoved | Where-Object { $_.Location -eq 'Desktop' })[0]
+    Assert-That ($desktopResult.Success -and $desktopResult.Message -eq 'not present') "expected 'not present' when no shortcut exists, got Success=$($desktopResult.Success) Message='$($desktopResult.Message)'"
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: Uninstall-App treats an unavailable Desktop/Start Menu folder as nothing-to-remove, never throwing' -Body {
+    $sbx = New-Sbx -Label 'uninstall-shortcuts-unavailable-folder'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $summary = Uninstall-App -ProgramDir $programDir -DataDir $dataDir -ConfPath $null -DesktopDir '' -ProgramsDir ''
+
+    Assert-That (@($summary.ShortcutsRemoved | Where-Object { -not $_.Success }).Count -eq 0) 'an unavailable shortcut folder must be reported as success (nothing to remove), never a failure'
+    Assert-That $summary.Success 'uninstall overall must still succeed when shortcut folders are simply unavailable on this platform'
+} | Out-Null
+
+Invoke-Scenario -Name 'Dispatch: install with no shortcut switches never touches shortcut creation (default headless behavior unchanged)' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'dispatch-install-no-shortcuts'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+
+    $result = Invoke-ManagerAction -Action 'install' -ScriptDir $script:RepoRoot -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource
+    Assert-That ($script:ShortcutCalls.Count -eq 0) 'a plain headless install (no -AddStartMenuShortcut/-AddDesktopShortcut) must never attempt shortcut creation'
+    Assert-That ($result.PSObject.Properties.Match('ShortcutsCreated').Count -eq 0) 'the install result must not carry a ShortcutsCreated property when no shortcut switch was passed'
+} | Out-Null
+
+Invoke-Scenario -Name 'Dispatch: install -AddStartMenuShortcut -AddDesktopShortcut invokes New-ManagerShortcut with the resolved PROGRAM dir and both locations requested' -Body {
+    # Shims New-ManagerShortcut itself (not just New-ShortcutFile) for this
+    # one scenario -- unlike the direct New-ManagerShortcut tests above,
+    # this is purely about the CLI dispatch wiring (does -Action install
+    # actually call New-ManagerShortcut with the right arguments when
+    # asked), not about real Desktop/Programs folder resolution, which
+    # Get-ManagerShortcutPaths and New-ManagerShortcut's own tests already
+    # cover directly against sandbox folders. Captures and restores the
+    # real function afterward so it stays real for any other scenario.
+    $originalNewManagerShortcut = ${function:New-ManagerShortcut}
+    $script:ManagerShortcutCalls = New-Object System.Collections.Generic.List[object]
+    function script:New-ManagerShortcut {
+        param([string]$ProgramDir, [switch]$StartMenu, [switch]$Desktop, [string]$DesktopDir, [string]$ProgramsDir)
+        $script:ManagerShortcutCalls.Add([PSCustomObject]@{ ProgramDir = $ProgramDir; StartMenu = [bool]$StartMenu; Desktop = [bool]$Desktop })
+        return @(
+            [PSCustomObject]@{ Location = 'StartMenu'; Path = 'fake-start-menu.lnk'; Success = $true; Message = 'created' },
+            [PSCustomObject]@{ Location = 'Desktop'; Path = 'fake-desktop.lnk'; Success = $true; Message = 'created' }
+        )
+    }
+    try {
+        $sbx = New-Sbx -Label 'dispatch-install-with-shortcuts'
+        $programDir = Join-Path $sbx 'program'
+        $dataDir = Join-Path $sbx 'data'
+
+        $result = Invoke-ManagerAction -Action 'install' -ScriptDir $script:RepoRoot -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -AddStartMenuShortcut -AddDesktopShortcut
+
+        Assert-That ($script:ManagerShortcutCalls.Count -eq 1) "expected exactly 1 call to New-ManagerShortcut, got $($script:ManagerShortcutCalls.Count)"
+        $call = $script:ManagerShortcutCalls[0]
+        Assert-That ($call.ProgramDir -eq $programDir) 'New-ManagerShortcut should be called with the resolved PROGRAM dir'
+        Assert-That ($call.StartMenu) 'StartMenu should be requested when -AddStartMenuShortcut is passed'
+        Assert-That ($call.Desktop) 'Desktop should be requested when -AddDesktopShortcut is passed'
+        Assert-That ($result.PSObject.Properties.Match('ShortcutsCreated').Count -gt 0) 'the install result should carry a ShortcutsCreated property when a shortcut switch was passed'
+    }
+    finally {
+        ${function:New-ManagerShortcut} = $originalNewManagerShortcut
+    }
+} | Out-Null
+
+# ===========================================================================
+# Get-VibepolloConnectionStatus -- headless status computation extracted
+# from Show-MainWindow's Sync-VibepolloStatus (previously untestable: only
+# a source-regex check that the function existed)
+# ===========================================================================
+
+Invoke-Scenario -Name 'Get-VibepolloConnectionStatus: a blank/unknown conf path reports NotFound' -Body {
+    $status = Get-VibepolloConnectionStatus -ConfPath $null -DataDir '/fake/data'
+    Assert-That ($status.State -eq 'NotFound') "expected State 'NotFound', got '$($status.State)'"
+    Assert-That ($status.Text -match 'Not connected -- no Vibepollo') 'the text should explain nothing was found automatically'
+
+    $statusBlank = Get-VibepolloConnectionStatus -ConfPath '' -DataDir '/fake/data'
+    Assert-That ($statusBlank.State -eq 'NotFound') 'a blank (not just $null) ConfPath should also report NotFound'
+} | Out-Null
+
+Invoke-Scenario -Name 'Get-VibepolloConnectionStatus: a conf with malformed global_prep_cmd JSON reports Unreadable, distinct from NotConnected' -Body {
+    $sbx = New-Sbx -Label 'status-unreadable'
+    $confPath = Join-Path $sbx 'sunshine.conf'
+    Write-TextFile -Path $confPath -Content "global_prep_cmd = not valid json`n"
+
+    $status = Get-VibepolloConnectionStatus -ConfPath $confPath -DataDir (Join-Path $sbx 'data')
+    Assert-That ($status.State -eq 'Unreadable') "expected State 'Unreadable', got '$($status.State)'"
+    Assert-That ($status.Text -match 'Conf found but unreadable') 'the text should distinguish this from a plain not-connected state'
+    Assert-That ($status.Text -match [regex]::Escape($confPath)) 'the text should still name the conf path'
+} | Out-Null
+
+Invoke-Scenario -Name 'Get-VibepolloConnectionStatus: a conf with our entry reports Connected' -Body {
+    $sbx = New-Sbx -Label 'status-connected'
+    $confPath = Join-Path $sbx 'sunshine.conf'
+    New-ConfFixture -Path $confPath -Content "k = v`n"
+    $dataDir = Join-Path $sbx 'data'
+
+    $addResult = Add-PrepCommandEntry -ConfPath $confPath -DataDir $dataDir
+    Assert-That $addResult.Success 'sanity: connecting should succeed against a clean conf'
+
+    $status = Get-VibepolloConnectionStatus -ConfPath $confPath -DataDir $dataDir
+    Assert-That ($status.State -eq 'Connected') "expected State 'Connected', got '$($status.State)'"
+    Assert-That ($status.Text -match '^Connected:') 'the text should start with Connected:'
+} | Out-Null
+
+Invoke-Scenario -Name 'Get-VibepolloConnectionStatus: a valid conf with no matching entry reports NotConnected' -Body {
+    $sbx = New-Sbx -Label 'status-not-connected'
+    $confPath = Join-Path $sbx 'sunshine.conf'
+    New-ConfFixture -Path $confPath -Content "k = v`n"
+
+    $status = Get-VibepolloConnectionStatus -ConfPath $confPath -DataDir (Join-Path $sbx 'data')
+    Assert-That ($status.State -eq 'NotConnected') "expected State 'NotConnected', got '$($status.State)'"
+    Assert-That ($status.Text -match '^Not connected:') 'the text should start with Not connected:'
+} | Out-Null
+
+# ===========================================================================
+# Get-HostConfRoots ordering -- ProgramW6432 must be probed BEFORE
+# $env:ProgramFiles (field bug: on a 32-bit process, $env:ProgramFiles
+# ALREADY points at the x86 alias, so checking it first silently prefers a
+# stale/decoy x86 install over the true 64-bit one)
+# ===========================================================================
+
+Invoke-Scenario -Name 'Find-HostConf: with a decoy known-name conf under the ProgramFiles(x86) alias AND a real one under ProgramW6432, the ProgramW6432 (true 64-bit) conf wins' -Body {
+    $sbxX86 = New-Sbx -Label 'root-order-x86'
+    $sbxTrue = New-Sbx -Label 'root-order-true'
+    $decoyPath = Join-Path (Join-Path (Join-Path $sbxX86 'Apollo') 'config') 'apollo.conf'
+    $realPath = Join-Path (Join-Path (Join-Path $sbxTrue 'Apollo') 'config') 'apollo.conf'
+    Write-TextFile -Path $decoyPath -Content 'sunshine_name = Decoy'
+    Write-TextFile -Path $realPath -Content 'sunshine_name = RealInstall'
+
+    $saved = Backup-ProgramFilesEnv
+    try {
+        # Exactly the WOW64 shape: a 32-bit process's $env:ProgramFiles IS
+        # the x86 alias, which here happens to also hold a decoy conf.
+        $env:ProgramFiles = $sbxX86
+        $env:ProgramW6432 = $sbxTrue
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $sbxX86)
+
+        $found = Find-HostConf
+        Assert-That ($found -eq $realPath) "expected the ProgramW6432-rooted conf ($realPath) to win over the ProgramFiles(x86)-alias decoy ($decoyPath), got: $found"
+    }
+    finally {
+        Restore-ProgramFilesEnv -Backup $saved
+    }
+} | Out-Null
+
+# ===========================================================================
+# Find-HostConfByWildcard -ExtraConfigDirs -- extends the wildcard fallback
+# to a matching service's own binary directory (and its config\ subfolder),
+# which the static candidate pass alone does not cover for a RENAMED conf
+# ===========================================================================
+
+Invoke-Scenario -Name 'Find-HostConfByWildcard: -ExtraConfigDirs scans a literal directory directly (not nested under an appDir), for a renamed conf' -Body {
+    $sbx = New-Sbx -Label 'wildcard-extra-dirs'
+    $serviceConfigDir = Join-Path $sbx 'config'
+    $confPath = Join-Path $serviceConfigDir 'custom-name.conf'
+    Write-TextFile -Path $confPath -Content 'k = v'
+
+    $found = Find-HostConfByWildcard -Roots @() -ExtraConfigDirs @($serviceConfigDir)
+    Assert-That ($found -eq $confPath) "expected the extra-config-dir conf ($confPath) to be found, got: $found"
+} | Out-Null
+
+Invoke-Scenario -Name 'Find-HostConf: the wildcard fallback also covers a matching service''s own binary directory for a renamed conf (custom-location install)' -Body {
+    # Shims Get-HostServiceBinaryDir (captured/restored afterward) to
+    # simulate a running Vibepollo/Apollo/Sunshine service whose binary
+    # lives outside every Program Files root entirely -- the scenario
+    # Get-HostServiceBinaryDir exists to hint at.
+    $originalGetHostServiceBinaryDir = ${function:Get-HostServiceBinaryDir}
+    $sbx = New-Sbx -Label 'find-conf-service-dir-renamed'
+    $serviceBinDir = Join-Path $sbx 'D-Games-Apollo'
+    $serviceConfigDir = Join-Path $serviceBinDir 'config'
+    $confPath = Join-Path $serviceConfigDir 'my-renamed-install.conf'
+    Write-TextFile -Path $confPath -Content 'sunshine_name = CustomLocation'
+
+    # $script: scope, not lexical capture -- same pattern the harness
+    # already uses for every other shim's configurable state
+    # ($script:UnregisterShouldThrowFor, $script:ShortcutCreateShouldThrowFor,
+    # ...), so the redefined function sees it reliably regardless of when
+    # or from which call site it is later invoked.
+    $script:FakeServiceBinDirForTest = $serviceBinDir
+    function script:Get-HostServiceBinaryDir {
+        param([string[]]$NamePatterns)
+        return @($script:FakeServiceBinDirForTest)
+    }
+
+    $saved = Backup-ProgramFilesEnv
+    try {
+        $emptyRoot = New-Sbx -Label 'find-conf-service-dir-empty-root'
+        $env:ProgramFiles = $emptyRoot
+        $env:ProgramW6432 = $emptyRoot
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $null)
+
+        $found = Find-HostConf
+        Assert-That ($found -eq $confPath) "expected Find-HostConf to find the renamed conf under the service's own directory ($confPath), got: $found"
+    }
+    finally {
+        Restore-ProgramFilesEnv -Backup $saved
+        ${function:Get-HostServiceBinaryDir} = $originalGetHostServiceBinaryDir
+    }
+} | Out-Null
+
+# ===========================================================================
+# Reparse-point ancestor guard -- Test-IsReparsePoint alone only inspects
+# the final path component; a junction/symlink on a PARENT directory is
+# invisible to it because Get-Item transparently resolves through it
+# ===========================================================================
+
+Invoke-Scenario -Name 'Test-AnyAncestorIsReparsePoint: detects a symlinked PARENT directory, and does not false-positive on an ordinary path' -Body {
+    $sbx = New-Sbx -Label 'reparse-ancestor'
+    $realDir = Join-Path $sbx 'real'
+    New-Item -ItemType Directory -Path $realDir -Force | Out-Null
+    $ordinaryConfPath = Join-Path $realDir 'sunshine.conf'
+    Write-TextFile -Path $ordinaryConfPath -Content "k = v`n"
+
+    Assert-That (-not (Test-AnyAncestorIsReparsePoint -Path $ordinaryConfPath)) 'an ordinary (non-symlinked) parent chain must not be flagged'
+
+    $linkDir = Join-Path $sbx 'link'
+    $symlinkSupported = $true
+    try {
+        New-Item -ItemType SymbolicLink -Path $linkDir -Target $realDir -ErrorAction Stop | Out-Null
+    }
+    catch {
+        $symlinkSupported = $false
+    }
+    if (-not $symlinkSupported) {
+        # No permission to create symlinks on this host (e.g. Windows
+        # without Developer Mode / admin) -- nothing more to assert here.
+        return
+    }
+
+    $confPathViaLink = Join-Path $linkDir 'sunshine.conf'
+    Assert-That (Test-AnyAncestorIsReparsePoint -Path $confPathViaLink) 'a symlinked parent directory must be detected even though the leaf file itself is an ordinary file'
+} | Out-Null
+
+Invoke-Scenario -Name 'New-ConfBackup / Write-ConfGlobalPrepCmd: refuse to read/write through a reparse point sitting on a PARENT directory' -Body {
+    $sbx = New-Sbx -Label 'reparse-ancestor-write'
+    $realDir = Join-Path $sbx 'real'
+    New-Item -ItemType Directory -Path $realDir -Force | Out-Null
+    $confPath = Join-Path $realDir 'sunshine.conf'
+    Write-TextFile -Path $confPath -Content "k = v`n"
+
+    $linkDir = Join-Path $sbx 'link'
+    $symlinkSupported = $true
+    try {
+        New-Item -ItemType SymbolicLink -Path $linkDir -Target $realDir -ErrorAction Stop | Out-Null
+    }
+    catch {
+        $symlinkSupported = $false
+    }
+    if (-not $symlinkSupported) {
+        return
+    }
+
+    $confPathViaLink = Join-Path $linkDir 'sunshine.conf'
+
+    $threwBackup = $false
+    try {
+        New-ConfBackup -ConfPath $confPathViaLink | Out-Null
+    }
+    catch {
+        $threwBackup = $true
+        Assert-That ($_.Exception.Message -match 'parent directory') 'New-ConfBackup''s error should call out a parent-directory reparse point, not just the leaf'
+    }
+    Assert-That $threwBackup 'New-ConfBackup must refuse to read through a reparse point on a parent directory'
+
+    $threwWrite = $false
+    try {
+        Write-ConfGlobalPrepCmd -ConfPath $confPathViaLink -JsonValue '[]'
+    }
+    catch {
+        $threwWrite = $true
+        Assert-That ($_.Exception.Message -match 'parent directory') 'Write-ConfGlobalPrepCmd''s error should call out a parent-directory reparse point, not just the leaf'
+    }
+    Assert-That $threwWrite 'Write-ConfGlobalPrepCmd must refuse to write through a reparse point on a parent directory'
+} | Out-Null
+
+# ===========================================================================
+# Get-SettleAction: same double-quote guard Add-PrepCommandEntry already has
+# ===========================================================================
+
+Invoke-Scenario -Name 'Get-SettleAction: rejects a DataDir containing a double-quote character' -Body {
+    $threw = $false
+    try {
+        Get-SettleAction -DataDir 'C:\x" -foo bar' | Out-Null
+    }
+    catch {
+        $threw = $true
+        Assert-That ($_.Exception.Message -match 'double-quote') 'the error should explain the double-quote is the problem'
+    }
+    Assert-That $threw 'Get-SettleAction must reject a DataDir containing a double-quote, mirroring Add-PrepCommandEntry''s own guard'
+} | Out-Null
+
+# ===========================================================================
+# Uninstall-App: CWD safety + corrected skip-reason wording
+# ===========================================================================
+
+Invoke-Scenario -Name 'Uninstall-App: moves the process current directory away before deleting ProgramDir (Windows cannot delete a directory that is any process''s CWD)' -Body {
+    $sbx = New-Sbx -Label 'uninstall-cwd-safety'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $originalLocation = (Get-Location).Path
+    try {
+        Set-Location -LiteralPath $programDir
+        $summary = Uninstall-App -ProgramDir $programDir -DataDir $dataDir -ConfPath $null
+        Assert-That $summary.ProgramDirRemoved 'ProgramDir should still be removed even though it was the process''s current directory'
+        Assert-That ((Get-Location).Path -ne $programDir) 'Uninstall-App should move the current directory away from ProgramDir before attempting to delete it'
+    }
+    finally {
+        Set-Location -LiteralPath $originalLocation
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Uninstall-App: skip-reason wording describes the real marker-file condition, not a leaf-name expectation Test-LooksLikeOurInstallDirectory does not enforce' -Body {
+    $sbx = New-Sbx -Label 'uninstall-skip-wording'
+    $bogusProgramDir = Join-Path $sbx 'not-our-program-dir'
+    New-Item -ItemType Directory -Path $bogusProgramDir -Force | Out-Null
+    Write-TextFile -Path (Join-Path $bogusProgramDir 'unrelated.txt') -Content 'not manager.ps1'
+
+    $summary = Uninstall-App -ProgramDir $bogusProgramDir -DataDir (Join-Path $sbx 'data') -ConfPath $null
+    Assert-That (-not [string]::IsNullOrWhiteSpace($summary.ProgramDirSkipReason)) 'a skip reason should be set'
+    Assert-That ($summary.ProgramDirSkipReason -match 'marker files') 'the message should describe the real condition (missing marker files)'
+    Assert-That ($summary.ProgramDirSkipReason -notmatch "expected leaf name") 'the message must not claim a leaf-name requirement Test-LooksLikeOurInstallDirectory deliberately does not check'
+} | Out-Null
+
+# ===========================================================================
+# Invoke-ManagerAction 'uninstall': -DesktopDir/-ProgramsDir threaded through
+# (same over-the-shoulder-admin hazard -UserId already guards against,
+# applied to shortcut removal on an elevated re-entry)
+# ===========================================================================
+
+Invoke-Scenario -Name 'Dispatch: uninstall threads -DesktopDir/-ProgramsDir through to Uninstall-App' -Body {
+    $sbx = New-Sbx -Label 'dispatch-uninstall-desktopdir'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    $desktopDir = Join-Path $sbx 'CustomDesktop'
+    $programsDir = Join-Path $sbx 'CustomPrograms'
+    New-Item -ItemType Directory -Path $desktopDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $programsDir -Force | Out-Null
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $desktopShortcut = Join-Path $desktopDir 'Stream Config Profiles.lnk'
+    Write-TextFile -Path $desktopShortcut -Content 'FAKE-LNK'
+
+    Invoke-ManagerAction -Action 'uninstall' -ScriptDir $script:RepoRoot -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -DesktopDir $desktopDir -ProgramsDir $programsDir | Out-Null
+
+    Assert-That (-not (Test-Path -LiteralPath $desktopShortcut)) 'the explicitly-passed -DesktopDir should actually be the one Uninstall-App used to find and remove the shortcut'
+} | Out-Null
+
+# ===========================================================================
+# Test-PathUnderTrustedProgramRoot -- registry-backed (GetFolderPath), not
+# $env:ProgramFiles/$env:ProgramW6432/$env:ProgramFiles(x86)-based, so an
+# unprivileged HKCU\Environment override cannot make an untrusted path
+# report as trusted
+# ===========================================================================
+
+Invoke-Scenario -Name 'Test-PathUnderTrustedProgramRoot: an arbitrary/blank path is never trusted' -Body {
+    Assert-That (-not (Test-PathUnderTrustedProgramRoot -Path '/some/random/untrusted/path/apollo.conf')) 'an arbitrary path unrelated to any resolvable Program Files root should not be trusted'
+    Assert-That (-not (Test-PathUnderTrustedProgramRoot -Path '')) 'a blank path should never be trusted'
+} | Out-Null
+
+# ===========================================================================
+# Uninstall discards the connected conf (BUG A, critical): the wizard's
+# connected conf path must flow through to Show-MainWindow and be preferred
+# over a fresh Find-HostConf guess in both the status display and the
+# Disconnect/Uninstall handler
+# ===========================================================================
+
+Invoke-Scenario -Name 'Show-VibepolloConnectDialog returns the connected ConfPath alongside Connected, not just a bare bool' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $dialogBody = [regex]::Match($source, '(?s)function Show-VibepolloConnectDialog \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $dialogBody.Success 'sanity: should be able to locate Show-VibepolloConnectDialog''s body'
+    Assert-That ($dialogBody.Value -match [regex]::Escape('$outcomeState.ConfPath = $confPath')) 'a successful Connect should record the conf path on the returned object'
+    Assert-That ($dialogBody.Value -match 'return \$outcomeState\r?\n') 'the dialog should return the whole outcome object (Connected + ConfPath), not just a bare bool'
+} | Out-Null
+
+Invoke-Scenario -Name 'Show-MainWindow accepts a -ConfPath and tracks it (via $vibepolloConnection) instead of only ever re-guessing with Find-HostConf' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+
+    Assert-That ($windowBody.Value -match '\[string\]\$ConfPath') 'Show-MainWindow should declare a -ConfPath parameter'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$vibepolloConnection = [PSCustomObject]@{ ConfPath = $ConfPath }')) 'Show-MainWindow should seed a tracked connection object from the incoming -ConfPath'
+
+    # The Connect/Reconnect... handler must update the tracked object from
+    # the dialog's result.
+    Assert-That ($windowBody.Value -match [regex]::Escape('$vibepolloConnection.ConfPath = [string]$dialogResult.ConfPath')) 'the Connect/Reconnect... handler should update the tracked conf path on a successful connect'
+
+    # The Disconnect/Uninstall handler must prefer the tracked path over a
+    # fresh Find-HostConf guess -- this is the actual field bug: the guess
+    # cannot see a portable/custom-path conf reached only via Browse.
+    $disconnectHandler = [regex]::Match($windowBody.Value, '(?s)\$btnDisconnect\.Add_Click\(\{.*?\}\)\r?\n\r?\n    \$form\.ShowDialog')
+    Assert-That $disconnectHandler.Success 'sanity: should be able to locate the Disconnect/Uninstall click handler'
+    Assert-That ($disconnectHandler.Value -match [regex]::Escape('$vibepolloConnection.ConfPath')) 'the Disconnect/Uninstall handler should consult the tracked conf path'
+    $preferIndex = $disconnectHandler.Value.IndexOf('$vibepolloConnection.ConfPath')
+    $guessIndex = $disconnectHandler.Value.IndexOf('Find-HostConf')
+    Assert-That ($preferIndex -ge 0 -and $guessIndex -ge 0 -and $preferIndex -lt $guessIndex) 'the tracked conf path must be checked BEFORE falling back to a fresh Find-HostConf guess'
+} | Out-Null
+
+Invoke-Scenario -Name 'Show-FirstRunWizard only hands the conf path to Show-MainWindow as "connected" when the wizard''s own Connect actually succeeded' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $wizardBody = [regex]::Match($source, '(?s)function Show-FirstRunWizard \{.*?\n\}\r?\n\r?\nfunction Show-VibepolloConnectDialog')
+    Assert-That $wizardBody.Success 'sanity: should be able to locate Show-FirstRunWizard''s body'
+    Assert-That ($wizardBody.Value -match '(?s)if\s*\(\[bool\]\$state\.VibepolloConnected\)\s*\{\s*\$connectedConfPathForMainWindow\s*=\s*\$state\.ConfPath') 'Show-MainWindow should only be told a conf is connected when $state.VibepolloConnected is actually true'
+    Assert-That ($wizardBody.Value -match [regex]::Escape('-ConfPath $connectedConfPathForMainWindow')) 'Show-MainWindow should be called with the gated conf path'
+} | Out-Null
+
+Invoke-Scenario -Name 'Show-WizardVibepolloStep: editing the conf textbox after a successful Connect invalidates VibepolloConnected (does not silently keep gating Next as connected)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $stepBody = [regex]::Match($source, '(?s)function Show-WizardVibepolloStep \{.*?\n\}\r?\n\r?\nfunction Show-WizardWatchdogStep')
+    Assert-That $stepBody.Success 'sanity: should be able to locate Show-WizardVibepolloStep''s body'
+
+    Assert-That ($stepBody.Value -match [regex]::Escape('$txtConf.Add_TextChanged({')) 'the conf textbox should have a TextChanged handler'
+    Assert-That ($stepBody.Value -match [regex]::Escape('$State.ConnectedConfPath = $confPath')) 'a successful Connect should record which conf path it connected'
+    Assert-That ($stepBody.Value -match '(?s)Add_TextChanged\(\{.*?VibepolloConnected\s*=\s*\$false') 'the TextChanged handler should reset VibepolloConnected to $false when the text no longer matches the connected conf path'
+} | Out-Null
+
+Invoke-Scenario -Name 'Show-WizardInstallStep: a successful install repoints State.ManagerScriptPath at the PROGRAM copy, not the process''s original (possibly %TEMP%-extracted) launch path' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $stepBody = [regex]::Match($source, '(?s)function Show-WizardInstallStep \{.*?\n\}\r?\n\r?\nfunction Show-WizardVibepolloStep')
+    Assert-That $stepBody.Success 'sanity: should be able to locate Show-WizardInstallStep''s body'
+    Assert-That ($stepBody.Value -match [regex]::Escape('$State.ManagerScriptPath = $r.ManagerPath')) 'a successful install should repoint State.ManagerScriptPath at the freshly-installed PROGRAM copy'
+} | Out-Null
+
+Invoke-Scenario -Name 'Disconnect/Uninstall success text calls out plainly when no conf was known/found, so it can never claim a disconnect that did not happen' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    Assert-That ($source -match [regex]::Escape('No Vibepollo/Apollo conf file was connected or found automatically, so no connection entry was removed.')) 'the uninstall success dialog should explicitly say when no conf was touched'
+} | Out-Null
+
+# ===========================================================================
+# Show-WizardDoneStep: shortcut checkbox defaults + Finish handler wiring
+# (previously zero coverage -- not even a source regex check)
+# ===========================================================================
+
+Invoke-Scenario -Name 'Show-WizardDoneStep: Start Menu checkbox defaults checked, Desktop checkbox defaults unchecked' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $stepBody = [regex]::Match($source, '(?s)function Show-WizardDoneStep \{.*?\n\}\r?\n\r?\nfunction Show-FirstRunWizard')
+    Assert-That $stepBody.Success 'sanity: should be able to locate Show-WizardDoneStep''s body'
+
+    Assert-That ($stepBody.Value -match [regex]::Escape("New-GuiCheckBox -Text 'Add to Start Menu'") + '.*-Checked \$true') 'the Start Menu shortcut checkbox should default checked'
+    Assert-That ($stepBody.Value -match [regex]::Escape("New-GuiCheckBox -Text 'Create Desktop shortcut'") + '.*-Checked \$false') 'the Desktop shortcut checkbox should default unchecked'
+} | Out-Null
+
+Invoke-Scenario -Name 'Show-WizardDoneStep: the Finish handler binds New-ManagerShortcut''s -StartMenu/-Desktop to the two checkboxes'' actual Checked state' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $stepBody = [regex]::Match($source, '(?s)function Show-WizardDoneStep \{.*?\n\}\r?\n\r?\nfunction Show-FirstRunWizard')
+    Assert-That $stepBody.Success 'sanity: should be able to locate Show-WizardDoneStep''s body'
+
+    $finishHandler = [regex]::Match($stepBody.Value, '(?s)\$btnFinish\.Add_Click\(\{.*?\}\)')
+    Assert-That $finishHandler.Success 'sanity: should be able to locate the Finish button''s click handler'
+
+    Assert-That ($finishHandler.Value -match [regex]::Escape('$addStartMenu = $cbStartMenuShortcut.Checked')) 'the Finish handler should read the Start Menu checkbox''s actual Checked state'
+    Assert-That ($finishHandler.Value -match [regex]::Escape('$addDesktop = $cbDesktopShortcut.Checked')) 'the Finish handler should read the Desktop checkbox''s actual Checked state'
+    Assert-That ($finishHandler.Value -match [regex]::Escape('New-ManagerShortcut -ProgramDir $State.ProgramDir -StartMenu:$addStartMenu -Desktop:$addDesktop')) 'New-ManagerShortcut should be called with both switches bound to the checkboxes, not hardcoded'
+    Assert-That ($finishHandler.Value -match 'Invoke-GuiSafe') 'the shortcut creation call should go through Invoke-GuiSafe (a shortcut failure must never block finishing setup)'
 } | Out-Null
 
 # ===========================================================================

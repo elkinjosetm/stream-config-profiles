@@ -79,6 +79,21 @@ jobs:
         shell: pwsh
         run: ./tests/manager-tests.ps1
 
+      # make-dist-tests.ps1 covers build/make-dist.ps1 the same way the two
+      # suites above cover sync-configs.ps1 and manager.ps1 -- it must pass
+      # on every leg too. Split into two steps for the same reason as
+      # above: `shell:` does not accept a matrix expression, so each
+      # candidate shell gets its own step gated by `if:`.
+      - name: Run make-dist test suite (Windows PowerShell 5.1)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./tests/make-dist-tests.ps1
+
+      - name: Run make-dist test suite (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: ./tests/make-dist-tests.ps1
+
   build-dist:
     name: Build dist + verify payload duality (dev + release)
     runs-on: ubuntu-latest
@@ -162,7 +177,7 @@ jobs:
           # passing an array of paths gets silently space-joined by
           # PowerShell's parameter binder into one nonexistent path. Invoke
           # once per target file and aggregate instead.
-          $targets = @('sync-configs.ps1', 'tests/run-tests.ps1', 'manager.ps1', 'tests/manager-tests.ps1', 'build/make-dist.ps1')
+          $targets = @('sync-configs.ps1', 'tests/run-tests.ps1', 'manager.ps1', 'tests/manager-tests.ps1', 'build/make-dist.ps1', 'tests/make-dist-tests.ps1')
           foreach ($t in $targets) {
               if (-not (Test-Path -LiteralPath $t)) {
                   throw "lint target not found: $t"
