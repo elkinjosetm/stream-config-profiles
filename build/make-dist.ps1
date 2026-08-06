@@ -351,9 +351,15 @@ function New-DistSetupBatExtractCommandText {
     #      copying them verbatim is what makes the extracted file
     #      byte-identical to dist\manager.ps1 (see
     #      Get-ExtractedSetupPayloadBytes, which self-tests exactly this).
-    #   5. Runs that file with -ExecutionPolicy Bypass -File (never
-    #      Invoke-Expression -- extract-to-file-then-run is auditable: the
-    #      exact bytes about to execute can be inspected on disk first).
+    #   5. Runs that file with -ExecutionPolicy Bypass -WindowStyle Hidden
+    #      -File (never Invoke-Expression -- extract-to-file-then-run is
+    #      auditable: the exact bytes about to execute can be inspected on
+    #      disk first). -WindowStyle Hidden here is belt-and-suspenders on
+    #      top of the outer powershell.exe invocation already carrying it
+    #      (see New-DistSetupBatHeaderText) -- this inner process shares
+    #      that same console, so hiding it twice costs nothing and covers
+    #      hosts where only one of the two actually takes effect. The GUI
+    #      window manager.ps1 itself opens is unaffected either way.
     #      $LASTEXITCODE is captured into a local variable and defaulted to
     #      1 if it is ever $null (e.g. the "&" invocation never actually
     #      ran -- powershell.exe missing/blocked -- which surfaces as a
@@ -394,7 +400,7 @@ function New-DistSetupBatExtractCommandText {
     # manager.ps1. Splitting it here keeps the real marker line the only
     # place the full sequence appears, so first-match search is correct.
     $template = @'
-$p=$env:SCP_SELF;$b=[IO.File]::ReadAllBytes($p);$mk=[Text.Encoding]::ASCII.GetBytes('__MARKER_A__'+'__MARKER_B__');$n=$mk.Length;$idx=-1;for($i=0;$i -le $b.Length-$n;$i++){if($b[$i] -eq $mk[0]){$ok=$true;for($j=1;$j -lt $n;$j++){if($b[$i+$j] -ne $mk[$j]){$ok=$false;break}};if($ok){$idx=$i;break}}};if($idx -lt 0){Write-Error 'stream-config-profiles: payload marker not found -- this setup file is corrupt or truncated.';exit 1};$after=$idx+$n;if($after -lt $b.Length -and $b[$after] -eq 13){$after++};if($after -lt $b.Length -and $b[$after] -eq 10){$after++};if($after -ge $b.Length){Write-Error 'stream-config-profiles: empty payload -- this setup file is corrupt or truncated.';exit 1};$len=$b.Length-$after;$pl=New-Object byte[] $len;[Array]::Copy($b,$after,$pl,0,$len);$dir=Join-Path $env:TEMP ('scp_'+[Guid]::NewGuid().ToString('N'));New-Item -ItemType Directory -Path $dir -Force | Out-Null;$mp=Join-Path $dir 'manager.ps1';[IO.File]::WriteAllBytes($mp,$pl);$psExe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe';& $psExe -NoProfile -ExecutionPolicy Bypass -File $mp;$ec=$LASTEXITCODE;if($null -eq $ec){$ec=1};Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue;exit $ec
+$p=$env:SCP_SELF;$b=[IO.File]::ReadAllBytes($p);$mk=[Text.Encoding]::ASCII.GetBytes('__MARKER_A__'+'__MARKER_B__');$n=$mk.Length;$idx=-1;for($i=0;$i -le $b.Length-$n;$i++){if($b[$i] -eq $mk[0]){$ok=$true;for($j=1;$j -lt $n;$j++){if($b[$i+$j] -ne $mk[$j]){$ok=$false;break}};if($ok){$idx=$i;break}}};if($idx -lt 0){Write-Error 'stream-config-profiles: payload marker not found -- this setup file is corrupt or truncated.';exit 1};$after=$idx+$n;if($after -lt $b.Length -and $b[$after] -eq 13){$after++};if($after -lt $b.Length -and $b[$after] -eq 10){$after++};if($after -ge $b.Length){Write-Error 'stream-config-profiles: empty payload -- this setup file is corrupt or truncated.';exit 1};$len=$b.Length-$after;$pl=New-Object byte[] $len;[Array]::Copy($b,$after,$pl,0,$len);$dir=Join-Path $env:TEMP ('scp_'+[Guid]::NewGuid().ToString('N'));New-Item -ItemType Directory -Path $dir -Force | Out-Null;$mp=Join-Path $dir 'manager.ps1';[IO.File]::WriteAllBytes($mp,$pl);$psExe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe';& $psExe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $mp;$ec=$LASTEXITCODE;if($null -eq $ec){$ec=1};Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue;exit $ec
 '@
     $splitIndex = [int]([Math]::Floor($script:SetupPayloadMarker.Length / 2))
     $markerPartA = $script:SetupPayloadMarker.Substring(0, $splitIndex)
@@ -466,8 +472,23 @@ function New-DistSetupBatHeaderText {
         'rem they protect the assignment from spaces and other special',
         'rem characters in the expanded path -- and have no bearing on the',
         'rem PowerShell command that follows.',
+        'rem',
+        'rem -WindowStyle Hidden below hides the extraction/launch PowerShell',
+        'rem process''s own console: the cmd.exe window this batch file itself',
+        'rem opens (from being double-clicked) is left alone -- deliberately.',
+        'rem cmd does not offer a documented, universally-reliable way to',
+        'rem re-launch itself minimized/hidden from INSIDE a running .bat',
+        'rem without gambling with the "exit /b %ERRORLEVEL%" contract just',
+        'rem below (a self-relaunch via a second cmd/start invocation would',
+        'rem need its own exit-code plumbing back to the original process,',
+        'rem exactly the kind of thing this file goes out of its way to keep',
+        'rem simple -- see the marker/exit-code comments throughout this',
+        'rem function). Hiding the PowerShell window is the one part of the',
+        'rem field-reported "extra console window" complaint this step can',
+        'rem fix without touching that contract; the wizard GUI itself still',
+        'rem appears normally once manager.ps1 launches.',
         ('set "SCP_SELF=%~f0"'),
-        ('"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "' + $commandText + '"'),
+        ('"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' + $commandText + '"'),
         'exit /b %ERRORLEVEL%',
         $script:SetupPayloadMarker
     )

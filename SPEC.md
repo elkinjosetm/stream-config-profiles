@@ -277,18 +277,31 @@ All actions execute: `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPo
 ### Install Layout (v2 Contract)
 
 Two-folder design:
-- **Program folder:** `%LOCALAPPDATA%\Programs\stream-config-profiles\` holds `manager.ps1` only
+- **Program folder:** `%LOCALAPPDATA%\Programs\stream-config-profiles\` holds `manager.ps1` and `launch.vbs` (see below)
 - **Data folder:** `%LOCALAPPDATA%\stream-config-profiles\` holds `sync-configs.ps1` (engine), `paths.example.txt`, `paths.txt`, `state.json`, `sync.log`, `profiles\`
 
 Engine stays co-located with its data — `$PSScriptRoot` logic untouched. Vibepollo/Apollo
 registration points at `<DATA>\sync-configs.ps1`.
 
-Optionally, a "Stream Config Profiles.lnk" shortcut for `PROGRAM\manager.ps1` (launched via
-the real Windows PowerShell 5.1 executable, `-NoProfile -ExecutionPolicy Bypass -File`) may
-also exist at the Start Menu Programs folder and/or the Desktop -- created by
-`New-ManagerShortcut` (wizard Done step default: Start Menu checked, Desktop unchecked; or
-headlessly via `-AddStartMenuShortcut`/`-AddDesktopShortcut`) and removed, best-effort, by
-`uninstall`.
+Optionally, a "Stream Config Profiles.lnk" shortcut for `PROGRAM\manager.ps1` may also exist
+at the Start Menu Programs folder and/or the Desktop -- created by `New-ManagerShortcut`
+(wizard Done step default: Start Menu checked, Desktop unchecked; or headlessly via
+`-AddStartMenuShortcut`/`-AddDesktopShortcut`) and removed, best-effort, by `uninstall`. The
+shortcut's target is `wscript.exe "PROGRAM\launch.vbs"`, not `powershell.exe` directly: Windows
+Terminal (the default console host on Windows 11) does not reliably honor a console-hiding
+request made directly to `powershell.exe`, so a shortcut launching `powershell.exe` even with
+`-WindowStyle Hidden` (and the `.lnk`'s own `WindowStyle` set to minimized) can still flash a
+visible console window alongside the GUI. `launch.vbs` (written into `PROGRAM` by `Install-App`,
+see `Get-ManagerLaunchVbsContent`) is a two-line Windows Script Host script that runs
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "PROGRAM\manager.ps1"`
+via `WshShell.Run(..., 0, False)`; `wscript.exe` is a genuinely windowless host, so no console is
+ever created regardless of the default console host. The `.lnk`'s own `WindowStyle` is still set
+to `7` (minimized) as cheap belt-and-suspenders. STA self-relaunches (`Start-GuiInStaIfNeeded`)
+and the elevated `-Action` re-entry (`Invoke-Elevated`) stay on plain `powershell.exe` with
+`-WindowStyle Hidden` (the elevated case hides via `Start-Process -WindowStyle Hidden` instead of
+a command-line token -- see `Start-ElevatedManagerProcess`) -- both are child processes of an
+already-running session, so a brief console flash there is acceptable and the `wscript.exe`
+indirection is not needed.
 
 ### Manager.ps1 Architecture
 

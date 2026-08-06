@@ -1707,25 +1707,81 @@ Invoke-Scenario -Name 'Vibepollo connect: Show-VibepolloConnectDialog and Show-W
 # Shortcuts: definition builder, paths, create (shimmed), remove
 # ===========================================================================
 
-Invoke-Scenario -Name 'Shortcuts: Get-ManagerShortcutDefinition builds the expected target/arguments/working directory, quoting a PROGRAM path with spaces' -Body {
+Invoke-Scenario -Name 'Shortcuts: Get-ManagerShortcutDefinition targets wscript.exe/launch.vbs (not powershell.exe directly), quoting a PROGRAM path with spaces, and sets WindowStyle 7' -Body {
     # Plain (non "C:\"-drive-letter) fake paths: Join-Path on a
     # non-Windows PowerShell host tries to resolve a leading "C:" against
     # a real PSDrive named C and throws "Cannot find drive" when none
     # exists (this test suite runs on Linux/pwsh in CI) -- an
     # implementation/test-host detail with no bearing on what this
     # scenario actually verifies (quoting a spaced path correctly).
+    #
+    # The shortcut's TARGET is deliberately wscript.exe "<PROGRAM>\
+    # launch.vbs", NOT powershell.exe directly -- see
+    # Get-ManagerLaunchVbsContent's own comment: Windows Terminal (the
+    # default Windows 11 console host) does not reliably honor
+    # -WindowStyle Hidden for a console it hosts, so a shortcut that
+    # launches powershell.exe directly can still flash a visible console
+    # window alongside the GUI even with -WindowStyle Hidden AND a
+    # minimized .lnk WindowStyle. wscript.exe never allocates a console at
+    # all, sidestepping that bug entirely. The .lnk's own WindowStyle=7
+    # (minimized) is kept as cheap belt-and-suspenders.
     $programDir = '/fake/Users/John Doe/AppData/Local/Programs/stream-config-profiles'
     $def = Get-ManagerShortcutDefinition -ProgramDir $programDir -SystemRoot '/fake/Windows'
 
-    $expectedExe = Get-WindowsPowerShellExePath -SystemRoot '/fake/Windows'
-    $expectedManagerPath = Join-Path $programDir 'manager.ps1'
+    $expectedExe = Get-WscriptExePath -SystemRoot '/fake/Windows'
+    $expectedLaunchVbsPath = Join-Path $programDir 'launch.vbs'
 
     Assert-That ($def.Name -eq 'Stream Config Profiles') "expected shortcut Name 'Stream Config Profiles', got '$($def.Name)'"
-    Assert-That ($def.TargetPath -eq $expectedExe) "expected TargetPath '$expectedExe', got '$($def.TargetPath)'"
+    Assert-That ($def.TargetPath -eq $expectedExe) "expected TargetPath '$expectedExe' (wscript.exe), got '$($def.TargetPath)'"
     Assert-That ($def.WorkingDirectory -eq $programDir) 'WorkingDirectory should be PROGRAM, so a relative reference from manager.ps1 still resolves'
-    Assert-That ($def.Arguments -match [regex]::Escape('-NoProfile')) 'Arguments should include -NoProfile'
-    Assert-That ($def.Arguments -match [regex]::Escape('-ExecutionPolicy Bypass')) 'Arguments should include -ExecutionPolicy Bypass'
-    Assert-That ($def.Arguments -match [regex]::Escape('-File "' + $expectedManagerPath + '"')) 'Arguments should include a properly quoted -File "<PROGRAM>\manager.ps1" (the path contains a space and must survive as one token)'
+    Assert-That ($def.Arguments -eq ('"' + $expectedLaunchVbsPath + '"')) "expected Arguments to be the quoted launch.vbs path '$expectedLaunchVbsPath', got '$($def.Arguments)'"
+    Assert-That ($def.WindowStyle -eq 7) "expected the .lnk's own WindowStyle to be 7 (minimized), got '$($def.WindowStyle)'"
+} | Out-Null
+
+Invoke-Scenario -Name 'Shortcuts: Get-ManagerLaunchVbsContent embeds a correctly VBScript-quoted, spaced powershell.exe/manager.ps1 command line and runs it hidden (window style 0)' -Body {
+    # Plain fake paths for the same Join-Path/PSDrive reason as the
+    # shortcut-definition scenario above.
+    $programDir = '/fake/Users/John Doe/AppData/Local/Programs/stream-config-profiles'
+    $content = Get-ManagerLaunchVbsContent -ProgramDir $programDir -SystemRoot '/fake/Windows'
+
+    $expectedExe = Get-WindowsPowerShellExePath -SystemRoot '/fake/Windows'
+    $expectedManagerPath = Join-Path $programDir 'manager.ps1'
+    $expectedCommandLine = '"' + $expectedExe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $expectedManagerPath + '"'
+    # VBScript string-literal escaping doubles every embedded double quote.
+    $expectedVbsLiteral = $expectedCommandLine.Replace('"', '""')
+
+    Assert-That ($content -match [regex]::Escape('CreateObject("WScript.Shell")')) 'launch.vbs should instantiate WScript.Shell'
+    Assert-That ($content -match [regex]::Escape('objShell.Run "' + $expectedVbsLiteral + '", 0, False')) "launch.vbs should Run the quoted, doubled-quote-escaped command line hidden (style 0), got:`n$content"
+} | Out-Null
+
+Invoke-Scenario -Name 'Install-App: writes launch.vbs into PROGRAM alongside manager.ps1, pointing at THIS install''s own ProgramDir/manager.ps1' -Body {
+    $sbx = New-Sbx -Label 'install-launch-vbs'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+
+    $result = Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot
+
+    $expectedLaunchVbsPath = Join-Path $programDir 'launch.vbs'
+    Assert-That (Test-Path -LiteralPath $expectedLaunchVbsPath) 'PROGRAM\launch.vbs should exist after install'
+    Assert-That ($result.LaunchVbsPath -eq $expectedLaunchVbsPath) 'Install-App result should report the launch.vbs path it wrote'
+
+    $expectedContent = Get-ManagerLaunchVbsContent -ProgramDir $programDir
+    Assert-That ((Read-TextFile $expectedLaunchVbsPath) -eq $expectedContent) 'installed launch.vbs content should match Get-ManagerLaunchVbsContent for this exact ProgramDir'
+    Assert-That ((Read-TextFile $expectedLaunchVbsPath) -match [regex]::Escape((Join-Path $programDir 'manager.ps1'))) 'installed launch.vbs should reference THIS install''s own manager.ps1 path, not a stale/different one'
+} | Out-Null
+
+Invoke-Scenario -Name 'Uninstall-App: removing PROGRAM also removes launch.vbs (it lives inside PROGRAM, deleted as part of the same recursive remove as manager.ps1)' -Body {
+    $sbx = New-Sbx -Label 'uninstall-removes-launch-vbs'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+    $launchVbsPath = Join-Path $programDir 'launch.vbs'
+    Assert-That (Test-Path -LiteralPath $launchVbsPath) 'sanity: launch.vbs should exist right after install'
+
+    $summary = Uninstall-App -ProgramDir $programDir -DataDir $dataDir
+
+    Assert-That ($summary.ProgramDirRemoved) 'PROGRAM should have been removed'
+    Assert-That (-not (Test-Path -LiteralPath $launchVbsPath)) 'launch.vbs must no longer exist once PROGRAM has been removed'
 } | Out-Null
 
 Invoke-Scenario -Name 'Shortcuts: Get-ManagerShortcutPaths builds Desktop/StartMenu paths from given folders, and degrades to $null when a folder is unavailable' -Body {
