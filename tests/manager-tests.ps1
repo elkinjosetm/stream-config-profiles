@@ -855,87 +855,77 @@ Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString renders switc
     Assert-That ($argString -match '-PollMinutes "10"') 'a non-string value should still be quoted'
 } | Out-Null
 
-Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString omits a caller-declined -IncludeLogon entirely -- regression for the field bug where an explicit -Name:$false token failed to bind at all across the real -File elevation boundary' -Body {
+Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString renders a caller-requested -SkipLogon as a bare flag -- regression for the field bug where an explicit -Name:$false token failed to bind at all across the real -File elevation boundary' -Body {
     # CRITICAL correctness, and the root cause of the actual field failure:
     # powershell.exe/pwsh invoked with -File (exactly how Invoke-Elevated
     # always re-launches this script) parses script arguments as literal,
-    # unevaluated strings. An explicit "-IncludeLogon:$false"/
-    # "-IncludeLogon:$true" token therefore arrives as the bare string
-    # "$false"/"$true", which PowerShell's own parameter binder cannot
-    # convert to a [SwitchParameter] -- crashing the elevated child outright
-    # ("Cannot convert value "System.String" to type SwitchParameter"),
-    # regardless of which way -IncludeLogon's own declared default points.
-    # The fix is not which token to render for false vs. true; it is to
-    # never render an explicit value token AT ALL: a present switch is a
-    # BARE -Name, an absent one is OMITTED, and -IncludeLogon is declared
-    # with a $false default at every boundary this can cross (see its own
-    # comment) so that omission is sound.
-    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; IncludeLogon = [switch]$false; IncludePoll = [switch]$true; PollMinutes = 10 }
-    Assert-That ($argString -notmatch '-IncludeLogon(?!\S)') 'a caller-declined -IncludeLogon must be omitted entirely, never rendered as a bare flag'
-    Assert-That ($argString -notmatch '-IncludeLogon:') 'a caller-declined -IncludeLogon must never render an explicit :$true/:$false value token'
+    # unevaluated strings. An explicit "-Name:$false"/"-Name:$true" token
+    # therefore arrives as the bare string "$false"/"$true", which
+    # PowerShell's own parameter binder cannot convert to a
+    # [SwitchParameter] -- crashing the elevated child outright ("Cannot
+    # convert value "System.String" to type SwitchParameter"). The fix is
+    # not which token to render for false vs. true; it is to never render
+    # an explicit value token AT ALL: a present switch is a BARE -Name, an
+    # absent one is OMITTED, and -SkipLogon (the parameter that actually
+    # crosses this boundary now -- see its own top-level comment) is
+    # declared with the ordinary $false default so that omission is sound
+    # in both directions with no special-casing.
+    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; SkipLogon = [switch]$true; IncludePoll = [switch]$true; PollMinutes = 10 }
+    Assert-That ($argString -match '(?<!\S)-SkipLogon(?!\S)') 'a caller-requested -SkipLogon (poll-only) must render as a bare -SkipLogon flag'
+    Assert-That ($argString -notmatch '-SkipLogon:') 'a caller-requested -SkipLogon must never render an explicit :$true value token'
     Assert-That ($argString -match '(?<!\S)-IncludePoll(?!\S)') 'a caller-requested -IncludePoll must render as a bare -IncludePoll flag'
     Assert-That ($argString -notmatch '-IncludePoll:') 'a caller-requested -IncludePoll must never render an explicit :$true value token'
 } | Out-Null
 
-Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString carries the ORIGINAL -UserId and -IncludeLogon through for a register-watchdog elevation retry' -Body {
+Invoke-Scenario -Name 'Elevation: ConvertTo-ElevatedArgumentString omits -SkipLogon entirely (Logon included) and carries the ORIGINAL -UserId through for a register-watchdog elevation retry' -Body {
     # CRITICAL correctness: this command line is what the elevated child
     # process actually receives. UserId must be the value resolved in the
     # ORIGINAL unelevated process (see Get-ResolvedUserId / the GUI call
     # sites), never left for the elevated child to re-derive from its own
     # (possibly different-admin) identity.
-    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; IncludeLogon = [switch]$true; IncludePoll = [switch]$false; PollMinutes = 15 }
+    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath '/m.ps1' -Action 'register-watchdog' -Parameters @{ DataDir = '/data'; UserId = 'OriginalInteractiveUser'; SkipLogon = [switch]$false; IncludePoll = [switch]$false; PollMinutes = 15 }
     Assert-That ($argString -match '-UserId "OriginalInteractiveUser"') 'the elevated re-entry command line must carry the original UserId explicitly'
-    Assert-That ($argString -match '(?<!\S)-IncludeLogon(?!\S)') 'a present -IncludeLogon should appear as a bare -IncludeLogon flag'
-    Assert-That ($argString -notmatch '-IncludeLogon:') 'a present -IncludeLogon must never render an explicit :$true value token'
+    Assert-That ($argString -notmatch '-SkipLogon(?!\S)') 'a caller that wants Logon included must have -SkipLogon omitted entirely, not rendered as a bare flag'
+    Assert-That ($argString -notmatch '-SkipLogon:') 'an absent -SkipLogon must never render an explicit :$false value token either'
     Assert-That ($argString -notmatch '-IncludePoll(?!\S)') 'an absent -IncludePoll should be omitted entirely, not rendered as a bare flag'
     Assert-That ($argString -notmatch '-IncludePoll:') 'an absent -IncludePoll must never render an explicit :$false value token either'
     Assert-That ($argString -match "-Action ""register-watchdog""") 'the re-entered action should be register-watchdog'
 } | Out-Null
 
-Invoke-Scenario -Name 'Elevation (end-to-end): a poll-only elevation retry, run through a REAL child pwsh process via the exact ConvertTo-ElevatedArgumentString/Start-Process mechanism Invoke-Elevated uses, never attempts a Logon REGISTRATION' -Body {
-    # This is the actual regression guard for the field bug, exercised
-    # across a real process boundary rather than just inspecting the
-    # rendered string: Start-Process -ArgumentList <single string> hands
-    # that string to the OS exactly once, unparsed -- .NET's Process class
-    # parses a single -ArgumentList/-Arguments string the same way on every
-    # platform before exec'ing the child, so this reproduces on Linux
-    # exactly what Invoke-Elevated does via Start-Process -Verb RunAs on
-    # real Windows (RunAs is the only part that is Windows-only). The child
-    # process is the real (non-dot-sourced, non-shimmed) manager.ps1, so it
-    # calls the real (Windows-only) ScheduledTasks cmdlets and is EXPECTED
-    # to report Success=$false / exit 1 on this Linux host -- that failure
-    # is not what this test checks. What it checks is WHICH task names were
-    # even attempted, which is decided entirely by how -IncludeLogon/
+function Invoke-E2EElevatedRegisterWatchdog {
+    # Shared plumbing for the two end-to-end scenarios below: builds the
+    # elevation-boundary argument string via the exact
+    # ConvertTo-ElevatedArgumentString/Start-Process mechanism Invoke-Elevated
+    # uses, runs it as a REAL child process, and returns the parsed JSON
+    # result array (or $null if this platform has no Start-Process at all).
+    # Start-Process -ArgumentList <single string> hands that string to the OS
+    # exactly once, unparsed -- .NET's Process class parses a single
+    # -ArgumentList/-Arguments string the same way on every platform before
+    # exec'ing the child, so this reproduces on Linux exactly what
+    # Invoke-Elevated does via Start-Process -Verb RunAs on real Windows
+    # (RunAs is the only part that is Windows-only). The child process is the
+    # real (non-dot-sourced, non-shimmed) manager.ps1, so it calls the real
+    # (Windows-only) ScheduledTasks cmdlets and is EXPECTED to report
+    # Success=$false / exit 1 on this Linux host -- that failure is not what
+    # either scenario checks. What they check is WHICH task names were even
+    # attempted (and, for Logon, whether it was a registration attempt or a
+    # reconcile-unregister), which is decided entirely by how -SkipLogon/
     # -IncludePoll bound in the child, before any cmdlet call happens.
-    #
-    # A 'StreamConfigProfiles-Settle-Logon' entry in the output is NOT
-    # itself the bug: Register-Watchdog is a full desired-state reconciler
-    # (see there), so -IncludeLogon:$false legitimately produces a
-    # reconcile-UNREGISTER result entry for Logon too. The actual field bug
-    # this guards against was TWO-FOLD, both now fixed in
-    # ConvertTo-ElevatedArgumentString/the -IncludeLogon declarations: (1) an
-    # explicit "-IncludeLogon:$false" token failed to bind AT ALL across
-    # this real -File process boundary ("Cannot convert value
-    # "System.String" to type SwitchParameter", since -File args are literal
-    # unevaluated strings), which is why the serializer now omits a
-    # false/absent switch entirely instead of rendering an explicit value
-    # token; and (2), had that omission alone been the whole fix without
-    # also changing -IncludeLogon's own declared default away from $true, an
-    # omitted -IncludeLogon would have silently bound to that stale $true
-    # default in the child -- a REGISTRATION attempt instead of the
-    # reconcile-unregister this test expects. Distinguished here by message
-    # shape: a real Register attempt on this cmdlet-less Linux host fails
-    # with a "term not recognized" message, while the reconcile-unregister
-    # no-ops successfully with a fixed message text.
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][hashtable]$ExtraParameters
+    )
+
     if (-not (Get-Command -Name 'Start-Process' -ErrorAction SilentlyContinue)) {
-        return
+        return $null
     }
-    $sbx = New-Sbx -Label 'e2e-elevated-poll-only'
+    $sbx = New-Sbx -Label $Label
     $stdout = Join-Path $sbx 'stdout.json'
     $stderr = Join-Path $sbx 'stderr.txt'
     $hostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
-    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath $script:ManagerScriptSource -Action 'register-watchdog' -Parameters @{ DataDir = $sbx; UserId = 'E2EUser'; IncludeLogon = [switch]$false; IncludePoll = [switch]$true; PollMinutes = 10 }
+    $parameters = @{ DataDir = $sbx; UserId = 'E2EUser' } + $ExtraParameters
+    $argString = ConvertTo-ElevatedArgumentString -ManagerScriptPath $script:ManagerScriptSource -Action 'register-watchdog' -Parameters $parameters
 
     $proc = Start-Process -FilePath $hostExe -ArgumentList $argString -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     Assert-That ($null -ne $proc) 'the child process should have started'
@@ -943,16 +933,16 @@ Invoke-Scenario -Name 'Elevation (end-to-end): a poll-only elevation retry, run 
     $stdoutText = Read-TextFile $stdout
     Assert-That (-not [string]::IsNullOrWhiteSpace($stdoutText)) "the child process should have printed its JSON result (stderr was: $(Read-TextFile $stderr))"
 
-    # $_.Name/$_.Message below are cast to [string] explicitly, and every
-    # filtered set is re-wrapped in @(...) before .Count, rather than
-    # comparing/indexing the raw ConvertFrom-Json output directly. This is
-    # the one assertion in the whole suite that inspects an object which
-    # crossed a REAL JSON serialize/deserialize boundary (every other
-    # entries[0]/results[0]-style assertion elsewhere in this file inspects
-    # a live in-process object). ConvertFrom-Json's shape (bare
-    # PSCustomObject vs Object[]) for a given payload can differ between
-    # Windows PowerShell 5.1 and pwsh 7, and a property fetched off an
-    # array-shaped element enumerates across every element instead of
+    # $_.Name/$_.Message are cast to [string] explicitly by every caller
+    # below, and every filtered set is re-wrapped in @(...) before .Count,
+    # rather than comparing/indexing the raw ConvertFrom-Json output
+    # directly. This is the one code path in the whole suite that inspects
+    # an object which crossed a REAL JSON serialize/deserialize boundary
+    # (every other entries[0]/results[0]-style assertion elsewhere in this
+    # file inspects a live in-process object). ConvertFrom-Json's shape
+    # (bare PSCustomObject vs Object[]) for a given payload can differ
+    # between Windows PowerShell 5.1 and pwsh 7, and a property fetched off
+    # an array-shaped element enumerates across every element instead of
     # returning one scalar -- so an unguarded "$x.Name -eq ..." or
     # "$x.Message -eq ..." can silently evaluate to a filtered ARRAY (0 or
     # 2+ elements) instead of a plain scalar bool. Assert-That's own
@@ -962,14 +952,70 @@ Invoke-Scenario -Name 'Elevation (end-to-end): a poll-only elevation retry, run 
     # outright instead of failing a plain assertion. Casting to [string]
     # first costs nothing when the value is already the plain string it is
     # supposed to be, and guarantees a scalar either way.
-    $parsed = @($stdoutText | ConvertFrom-Json)
+    return @($stdoutText | ConvertFrom-Json)
+}
+
+Invoke-Scenario -Name 'Elevation (end-to-end): a poll-only elevation retry (-SkipLogon), run through a REAL child pwsh process via the exact ConvertTo-ElevatedArgumentString/Start-Process mechanism Invoke-Elevated uses, never attempts a Logon REGISTRATION' -Body {
+    # This is the actual regression guard for the field bug. A
+    # 'StreamConfigProfiles-Settle-Logon' entry in the output is NOT itself
+    # the bug: Register-Watchdog is a full desired-state reconciler (see
+    # there), so -SkipLogon legitimately produces a reconcile-UNREGISTER
+    # result entry for Logon too. The actual field bug this guards against
+    # (under the OLD -IncludeLogon:$false top-level surface this scenario
+    # used to exercise) was TWO-FOLD: (1) an explicit "-IncludeLogon:$false"
+    # token failed to bind AT ALL across this real -File process boundary
+    # ("Cannot convert value "System.String" to type SwitchParameter", since
+    # -File args are literal unevaluated strings), which is why the
+    # serializer omits a false/absent switch entirely instead of rendering
+    # an explicit value token; and (2), had that omission alone been the
+    # whole fix without also changing the boundary parameter's own declared
+    # default to $false, an omitted flag would have silently bound to a
+    # stale $true default in the child -- a REGISTRATION attempt instead of
+    # the reconcile-unregister this test expects. -SkipLogon replaces that
+    # fragile two-part contract with one fact that -File binds identically
+    # on every host: presence/absence of a switch whose declared default IS
+    # absence. Distinguished here by message shape: a real Register attempt
+    # on this cmdlet-less Linux host fails with a "term not recognized"
+    # message, while the reconcile-unregister no-ops successfully with a
+    # fixed message text.
+    $parsed = Invoke-E2EElevatedRegisterWatchdog -Label 'e2e-elevated-poll-only' -ExtraParameters @{ SkipLogon = [switch]$true; IncludePoll = [switch]$true; PollMinutes = 10 }
+    if ($null -eq $parsed) {
+        return
+    }
+
     $pollEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Poll' })
     Assert-That (@($pollEntries).Count -eq 1) "expected exactly one Poll result entry across the real process boundary, got names: $((@($parsed | ForEach-Object { [string]$_.Name })) -join ', ')"
 
     $logonEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Logon' })
     if (@($logonEntries).Count -gt 0) {
         $logonMessage = [string]$logonEntries[0].Message
-        Assert-That ($logonMessage -eq 'unregistered (not requested)') "the field bug: a caller-declined -IncludeLogon:`$false must never reach a REGISTRATION attempt in the elevated child (it bound to its declared-true default instead, silently re-registering a task the user had just declined) -- got Logon result: Success=$($logonEntries[0].Success), Message='$logonMessage'"
+        Assert-That ($logonMessage -eq 'unregistered (not requested)') "the field bug: a caller-requested -SkipLogon must never reach a REGISTRATION attempt in the elevated child (it bound to Logon-included instead, silently re-registering a task the user had just declined) -- got Logon result: Success=$($logonEntries[0].Success), Message='$logonMessage'"
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Elevation (end-to-end): the INVERSE of the poll-only case -- no -SkipLogon at all, run through a REAL child pwsh process, attempts a Logon REGISTRATION (not a reconcile-unregister)' -Body {
+    # The other half of the SkipLogon boundary contract: omitting -SkipLogon
+    # entirely (exactly what ConvertTo-ElevatedArgumentString renders when
+    # the caller's SkipLogon is [switch]$false) must bind to Logon INCLUDED
+    # in the real elevated child, on every host -- this is the direction
+    # that was never actually broken by the original field bug, but is now
+    # the one this whole redesign hinges on staying correct with no
+    # ContainsKey trick anywhere between here and the child's own top-level
+    # param block.
+    $parsed = Invoke-E2EElevatedRegisterWatchdog -Label 'e2e-elevated-logon-included' -ExtraParameters @{ SkipLogon = [switch]$false; IncludePoll = [switch]$false }
+    if ($null -eq $parsed) {
+        return
+    }
+
+    $logonEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Logon' })
+    Assert-That (@($logonEntries).Count -eq 1) "expected exactly one Logon result entry across the real process boundary, got names: $((@($parsed | ForEach-Object { [string]$_.Name })) -join ', ')"
+    $logonMessage = [string]$logonEntries[0].Message
+    Assert-That ($logonMessage -ne 'unregistered (not requested)') "an absent -SkipLogon must reach a REGISTRATION attempt in the elevated child (Logon included), not a reconcile-unregister -- got Logon result: Success=$($logonEntries[0].Success), Message='$logonMessage'"
+
+    $pollEntries = @($parsed | Where-Object { [string]$_.Name -eq 'StreamConfigProfiles-Settle-Poll' })
+    if (@($pollEntries).Count -gt 0) {
+        $pollMessage = [string]$pollEntries[0].Message
+        Assert-That ($pollMessage -eq 'unregistered (not requested)') "Poll was not requested (-IncludePoll omitted), so any Poll entry must be a reconcile-unregister, not a registration attempt -- got Poll result: Success=$($pollEntries[0].Success), Message='$pollMessage'"
     }
 } | Out-Null
 
