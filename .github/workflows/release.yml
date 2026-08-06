@@ -3,10 +3,23 @@ name: Release
 # Fires only on an actual version tag push (v1.2.3, v2.0.0-rc1, ...) -- never
 # on a branch push -- so a release is always the result of a deliberate
 # `git tag vX.Y.Z && git push --tags`, not an accident of merging to main.
+#
+# Also fires on workflow_dispatch for an existing tag. A tag-push run is
+# frozen to the workflow file as it existed at the tagged commit, so once a
+# tag has been pushed there is no way to re-run the *current* pipeline
+# definition against it via the push trigger alone -- workflow_dispatch lets
+# a maintainer re-run this file's latest version (bug fixes, upsert logic,
+# etc.) against a tag that already exists.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish, e.g. v0.1.0'
+        required: true
+        type: string
 
 # Default to the minimum (read-only) grant; the one job that needs more
 # (release) opts in explicitly below. Keeping this at the workflow level
@@ -25,12 +38,23 @@ jobs:
   test:
     name: Quick test gate (pwsh / ubuntu)
     runs-on: ubuntu-latest
+    env:
+      # Same tag resolution as the release job below: on a tag push,
+      # ref_name *is* the tag; on workflow_dispatch it's the branch that
+      # triggered the manual run (typically the default branch), so the
+      # requested tag must come from the input instead.
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       # v4.4.0. Pinned to a full commit SHA rather than a mutable tag: a
       # compromised or retagged upstream action would otherwise execute
       # unreviewed in every job that follows.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # Check out the tag's code, not the default branch -- on a tag
+          # push this is a no-op (ref_name already is the tag), but on
+          # workflow_dispatch it's what makes the run build the requested
+          # tag instead of whatever branch the dispatch happened from.
+          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Run engine test suite
@@ -56,9 +80,14 @@ jobs:
     name: Build dist
     needs: test
     runs-on: ubuntu-latest
+    env:
+      # See the test job above for why this differs by trigger.
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # Check out the tag's code -- see the test job above.
+          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Run build/make-dist.ps1
@@ -136,16 +165,22 @@ jobs:
       attestations: write   # required by actions/attest-build-provenance
     env:
       # Passed through the environment rather than interpolated directly
-      # into a run: script (${{ github.ref_name }} inline in a bash block
-      # below): GitHub Actions substitutes expressions textually BEFORE
-      # the shell ever sees them, and ref names permit $, `, (, ), ;, &
-      # and | -- a tag like 'v1.0.0$(curl ...)' would otherwise execute
-      # arbitrary shell commands inside a job holding contents: write,
-      # id-token: write and attestations: write. Creating a tag typically
-      # bypasses the branch-protection/review controls that guard normal
-      # code changes, so this is the difference between "can push a tag"
-      # and "can run arbitrary code with the release token".
-      RELEASE_TAG: ${{ github.ref_name }}
+      # into a run: script (the expression inline in a bash block below):
+      # GitHub Actions substitutes expressions textually BEFORE the shell
+      # ever sees them, and both ref names and workflow_dispatch inputs
+      # permit $, `, (, ), ;, & and | -- a tag (or typed-in input) like
+      # 'v1.0.0$(curl ...)' would otherwise execute arbitrary shell
+      # commands inside a job holding contents: write, id-token: write and
+      # attestations: write. Creating a tag typically bypasses the
+      # branch-protection/review controls that guard normal code changes,
+      # so this is the difference between "can push a tag" and "can run
+      # arbitrary code with the release token".
+      #
+      # Resolved once here: on a tag push, ref_name is the tag; on a
+      # manual workflow_dispatch re-run (see the `on:` trigger above), the
+      # tag comes from the `tag` input instead, since ref_name would just
+      # be whatever branch the dispatch was run from.
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - name: Validate tag format
         run: |
@@ -200,14 +235,30 @@ jobs:
             dist/Install.bat
             dist/SHA256SUMS.txt
 
-      - name: Create GitHub Release and attach dist assets
+      - name: Create or update GitHub Release and attach dist assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$RELEASE_TAG" \
-            dist/manager.ps1 \
-            dist/Install.bat \
-            dist/SHA256SUMS.txt \
-            --title "$RELEASE_TAG" \
-            --generate-notes
+          # A release for this tag may already exist -- most commonly
+          # because a user published it by hand from the GitHub UI, which
+          # creates the release (and the tag) before this tag-push trigger
+          # ever fires. `gh release create` fails outright in that case
+          # ("a release with the same tag name already exists"), so check
+          # first and fall back to uploading (with --clobber, to allow a
+          # workflow_dispatch re-run to replace stale assets) instead of
+          # creating.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/manager.ps1 \
+              dist/Install.bat \
+              dist/SHA256SUMS.txt \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/manager.ps1 \
+              dist/Install.bat \
+              dist/SHA256SUMS.txt \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
