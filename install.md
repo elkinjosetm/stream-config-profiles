@@ -7,18 +7,18 @@
 
 ## Method A: Using the App (Recommended)
 
-The easiest way: download `manager.ps1` and `Install.bat` from the latest Release and run the wizard. You do not create or choose any folder yourself -- both the program and data locations are fixed (see File Locations in README.md) and the wizard just shows them to you.
+The easiest way: download `StreamConfigProfiles-Setup.bat` from the latest Release and run the wizard. You do not create or choose any folder yourself -- both the program and data locations are fixed (see File Locations in README.md) and the wizard just shows them to you.
 
 ### Installation Steps
 
-1. **Download** the latest `manager.ps1` and `Install.bat` from Releases, into any folder (e.g. your Downloads folder -- they don't need to live anywhere permanent; `Install.bat` copies `manager.ps1` into the real program folder for you)
-2. **Double-click `Install.bat`** — a five-step wizard appears:
+1. **Download** the latest `StreamConfigProfiles-Setup.bat` from Releases, into any folder (e.g. your Downloads folder -- it doesn't need to live anywhere permanent; it extracts and runs the installer)
+2. **Double-click `StreamConfigProfiles-Setup.bat`** — a five-step wizard appears:
    - **Welcome**: shows the fixed program folder (`%LOCALAPPDATA%\Programs\stream-config-profiles\`) and fixed data folder (`%LOCALAPPDATA%\stream-config-profiles\`) — neither is editable here
    - **Install files**: writes `sync-configs.ps1`, `paths.example.txt`, and a fresh `paths.txt` (copied from the template automatically -- no manual copy step) into the data folder, and copies `manager.ps1` into the program folder
-   - **Connect to Vibepollo/Apollo**: click **Connect** to edit its `.conf` file directly (automatic backup, no web UI needed) — Vibepollo/Apollo is usually auto-detected; browse to the file manually if not
-   - **Watchdog protection**: logon/unlock protection is checked by default, and an optional periodic poll checkbox is available too — both run entirely as you, so this step never needs administrator rights (see README.md's "About the Watchdog" for why there's no boot-time option)
-   - **Done**
-3. **Add your game config paths.** The wizard does not ask you to hand-edit `paths.txt` — after Setup finishes, the **Main Window** opens automatically (or reopen it any time by running `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1`). Use its **Add File...** / **Add Folder...** buttons to add each game's config path; **Remove Selected** to remove one.
+   - **Connect to Vibepollo/Apollo**: click **Connect** to edit its `.conf` file directly (automatic backup, no web UI needed) — Vibepollo/Apollo is usually auto-detected in the common config locations, with a wildcard fallback for renamed conf files; browse to the file manually if it isn't found automatically. The wizard warns explicitly if you skip this step
+   - **Watchdog protection**: logon/unlock protection is checked by default, and an optional periodic poll checkbox is available too. Both always *run* as you, but Windows may ask for administrator approval each time you *register* logon/unlock protection -- not only the first time -- (a Windows requirement for this specific kind of scheduled task, not something this app asks for on its own); approve it and only that one registration step runs elevated, the task itself still runs as your normal account. Checking the periodic poll box by itself does not trigger that prompt. See README.md's "About the Watchdog" for the details, and for why there's no boot-time option.
+   - **Done**: creates a Start Menu shortcut by default; optionally add a Desktop shortcut too
+3. **Add your game config paths.** The wizard does not ask you to hand-edit `paths.txt` — after Setup finishes, the **Main Window** opens automatically. Use its **Add File...** / **Add Folder...** buttons to add each game's config path; **Remove Selected** to remove one. Reopen the Main Window any time via the Start Menu or Desktop shortcut.
 4. **Done** — your next stream will use profiles automatically
 
 ### Verify Installation
@@ -160,9 +160,9 @@ If case (a) works as expected, installation is complete! Case (b) is just there 
 
 ### If You Used Method A (the App)
 
-1. **Run** `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` to open the Main Window, then click **Disconnect all / Uninstall...** at the bottom
+1. **Run** the app via the Start Menu shortcut (or run `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` directly), then click **Disconnect all / Uninstall...** at the bottom
 2. Confirm, and choose whether to also delete your data folder (configured paths, saved profiles, log) -- declining leaves it in place
-3. The app removes the Vibepollo/Apollo registration, the watchdog scheduled tasks, and the program folder (and, if you chose to, the data folder)
+3. The app removes the Vibepollo/Apollo registration, the watchdog scheduled tasks, the Start Menu and Desktop shortcuts, and the program folder (and, if you chose to, the data folder)
 
 ### If You Used Method B (Manual Setup)
 

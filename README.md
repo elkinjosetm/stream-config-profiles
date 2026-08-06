@@ -32,18 +32,18 @@ The tool uses a two-phase strategy designed to survive crashes and unexpected di
 
 ## The Easy Way: Install with the App
 
-1. **Download** `manager.ps1` and `Install.bat` from the latest Release
-2. **Double-click `Install.bat`** — a five-step wizard guides you through:
+1. **Download** `StreamConfigProfiles-Setup.bat` from the latest Release
+2. **Double-click `StreamConfigProfiles-Setup.bat`** — a five-step wizard guides you through:
    - **Welcome**: confirms the fixed program/data folder locations (neither is changeable)
    - **Install files**: writes the engine, template, and a fresh `paths.txt` into the data folder
-   - **Connect to Vibepollo/Apollo**: edits its `.conf` file directly, no web UI needed
-   - **Watchdog protection**: logon/unlock protection is on by default, running entirely as you -- no administrator rights needed (see "About the Watchdog" below)
-   - **Done**
-3. **Done** — your next stream will use the profiles automatically. Afterwards, add/remove game config paths from the Main Window (Add File/Add Folder) -- reopen it any time by running `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` again.
+   - **Connect to Vibepollo/Apollo**: edits its `.conf` file directly, no web UI needed; the wizard warns explicitly if you skip this step
+   - **Watchdog protection**: logon/unlock protection is on by default; Windows may ask for administrator approval to *register* it, but the watchdog itself always *runs* as your normal user account (see "About the Watchdog" below for when that approval prompt appears)
+   - **Done**: Start Menu shortcut created by default (optional Desktop shortcut available)
+3. **Done** — your next stream will use the profiles automatically. Afterwards, add/remove game config paths from the Main Window (Add File/Add Folder). Reopen it any time using the Start Menu shortcut, or optionally the Desktop shortcut if you created one during setup.
 
 ## File Locations
 
-- **Program file**: `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` (the GUI app -- this is also what you re-run to reopen the Main Window later)
+- **Program file**: `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` (the GUI app)
 - **Data & engine**: `%LOCALAPPDATA%\stream-config-profiles\` contains:
   - `sync-configs.ps1` (the core engine, called by Vibepollo)
   - `paths.txt` (your game paths)
@@ -54,10 +54,10 @@ The tool uses a two-phase strategy designed to survive crashes and unexpected di
 
 The "settle" watchdog fixes sessions that crashed or disconnected without properly closing, so your PC's local settings never get polluted by an orphaned streaming profile. It has two parts, registered independently:
 
-- **Logon / unlock** — on by default. Runs as you, no admin needed.
-- **Poll** — off by default; an optional periodic re-check every N minutes (min. 5).
+- **Logon / unlock** — on by default. Registering it can prompt Windows for administrator approval (see below); it always runs as you.
+- **Poll** — off by default; an optional periodic re-check every N minutes (min. 5). A poll-only selection does not itself require administrator approval to register.
 
-Both run entirely under your own account, so setting up or changing the watchdog never prompts for administrator rights. There is deliberately no boot-time (startup) task: local play after a reboot always requires logging in first, and the logon/unlock protection above already fires at exactly that moment. An earlier build did register a SYSTEM-level boot task, but it added an elevation surface (a privileged scheduled task pointing at a script in your ordinary, writable data folder) for no protection beyond what logon/unlock already provides, so it was removed. If you installed that earlier build, the app will try to clean up its leftover task the next time you unregister the watchdog or uninstall.
+Both parts always *run* entirely under your own account -- the watchdog itself is never elevated. *Registering* the logon/unlock part is a different story: Windows requires administrator approval to create a scheduled task with a logon-type trigger, even though the task's owner is your own account, so clicking Register/Update with logon/unlock protection checked can show a UAC prompt -- each time it (re-)registers that task, not only the first time (e.g. changing the poll interval and clicking Register/Update again re-registers logon/unlock too). If you approve it, only that one registration step runs elevated -- the task it creates still runs as you, same as always. Decline it and logon/unlock protection is simply not registered; everything else keeps working. The periodic poll task uses a different kind of trigger that Windows does not require approval for, so a poll-only selection does not itself trigger that prompt -- though the same Register/Update click also removes any logon/unlock task you just unchecked, and removing one that a previous approval left behind can still need approval of its own if that removal is denied. There is deliberately no boot-time (startup) task: local play after a reboot always requires logging in first, and the logon/unlock protection above already fires at exactly that moment. An earlier build did register a SYSTEM-level boot task, but it added an elevation surface (a privileged scheduled task pointing at a script in your ordinary, writable data folder) for no protection beyond what logon/unlock already provides, so it was removed. If you installed that earlier build, the app will try to clean up its leftover task the next time you unregister the watchdog or uninstall.
 
 Once configured, whichever parts you enabled run silently in the background.
 

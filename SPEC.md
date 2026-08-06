@@ -245,11 +245,27 @@ moment, covering the same window. Keeping an admin-level task whose action targe
 profile, rewritten in place by every unelevated `install`/reinstall -- bought zero
 additional protection over Logon alone while adding a real elevation-and-escalation
 surface (anything that can write to DATA while the Boot task exists gets SYSTEM
-execution at the next restart). Because every remaining watchdog task is purely
-user-level (Interactive principal, the resolved caller's own account),
-registering/unregistering the watchdog never needs elevation -- elevation in this
-tool is now reserved solely for conf editing/service restart and the uninstall paths
-that touch Program Files/protected locations.
+execution at the next restart). Every remaining watchdog task RUNS as a purely
+user-level principal (Interactive, the resolved caller's own account, Limited
+RunLevel) -- that runtime guarantee is unconditional. Registering that principal is
+a separate matter: on real Windows, `Register-ScheduledTask` requires administrator
+APPROVAL to register a logon-type trigger (`AtLogOn` / session-unlock) even when the
+principal being registered is the calling user themself, so `register-watchdog` can
+prompt for elevation whenever it (re-)registers the Logon task -- `Register-ScheduledTask
+-Force` is called unconditionally for every requested task, so this is not a
+one-time first-registration prompt; changing the poll interval and re-applying
+re-registers Logon too if it is still checked.
+The Poll task's time/repetition trigger does not have this requirement, so a
+poll-only registration (`-IncludeLogon:$false`) does not itself trigger that
+prompt for the ADD direction. `register-watchdog` is a full desired-state
+reconciler, though (see below): the same call also REMOVES whichever
+well-known task was not requested, so a poll-only call that also needs to
+remove an already-registered, possibly admin-owned Logon task can still
+prompt on that removal. Elevation in this
+tool is therefore reserved for: conf editing/service restart, the uninstall paths
+that touch Program Files/protected locations, and registering/unregistering the
+Logon-triggered watchdog task when Windows denies the unelevated attempt -- never
+for the GUI process as a whole, and the task's own principal is never elevated.
 `Unregister-Watchdog` still best-effort-removes a legacy `StreamConfigProfiles-Settle-Boot`
 task if one is found (cleanup for anyone who installed that interim build); since
 deleting an admin-level task from an unelevated process is expected to fail, that
@@ -266,12 +282,19 @@ Two-folder design:
 Engine stays co-located with its data — `$PSScriptRoot` logic untouched. Vibepollo/Apollo
 registration points at `<DATA>\sync-configs.ps1`.
 
+Optionally, a "Stream Config Profiles.lnk" shortcut for `PROGRAM\manager.ps1` (launched via
+the real Windows PowerShell 5.1 executable, `-NoProfile -ExecutionPolicy Bypass -File`) may
+also exist at the Start Menu Programs folder and/or the Desktop -- created by
+`New-ManagerShortcut` (wizard Done step default: Start Menu checked, Desktop unchecked; or
+headlessly via `-AddStartMenuShortcut`/`-AddDesktopShortcut`) and removed, best-effort, by
+`uninstall`.
+
 ### Manager.ps1 Architecture
 
 Single self-contained file, structured into regions:
 
 - **#region Core:** Headless functions (no GUI wiring). All manager core functions take explicit path parameters (no hardcoded env lookups inside logic) so tests can drive them against sandbox dirs cross-platform.
-- **#region Gui:** WinForms wiring. GUI never runs elevated wholesale; elevation only for specific admin operations (conf edit, service restart, uninstall paths that touch Program Files/protected locations) via `Start-Process -Verb RunAs` re-entry. Registering/unregistering the watchdog never routes through this -- every watchdog task is user-level, so there is nothing to elevate.
+- **#region Gui:** WinForms wiring. GUI never runs elevated wholesale; elevation only for specific admin operations (conf edit, service restart, uninstall paths that touch Program Files/protected locations, and register-watchdog/unregister-watchdog when the unelevated attempt is denied) via `Start-Process -Verb RunAs` re-entry. `Invoke-GuiElevatable` detects a denial two ways: a thrown access-denied-shaped exception (preferring the HRESULT/exception type over message text, since the field failure this exists to catch arrives as a localized message like "Acceso denegado"), or -- since Register-Watchdog/Unregister-Watchdog/Uninstall-App signal a per-task failure by RETURNING Success=$false rather than throwing -- treating ANY such Result-shaped failure from those three specific actions (`register-watchdog`, `unregister-watchdog`, `uninstall`) as elevation-eligible; `uninstall`'s top-level `Success` reflects only a failed nested watchdog unregister, so this never fires for an unrelated business-logic failure (e.g. malformed conf JSON) that elevating would not fix. Either path always confirms with the user before elevating, and `Invoke-GuiElevationRetry` skips straight to reporting the original failure -- no confirm dialog, no second elevation -- when this process is already running elevated, since `Start-Process -Verb RunAs` would otherwise trigger a pointless second UAC prompt for a failure elevation cannot fix. The re-entered `-UserId` is resolved once in the *original* unelevated process and passed through explicitly, never re-derived inside the elevated child, so an over-the-shoulder elevation approval by a *different* account than the one that started the action can't register the task under the wrong identity (this does not cover the GUI itself having been launched already elevated, in which case its own identity already is that admin account).
 - **#region EmbeddedPayload:** Two marked here-string slots, EMPTY in the repo (marked `<#PAYLOAD:ENGINE#>` and `<#PAYLOAD:TEMPLATE#>`).
 
 **Dev mode:** When payload slots are empty, manager loads `sync-configs.ps1` and `paths.example.txt` from its own script directory (the repo).
@@ -285,11 +308,13 @@ Single self-contained file, structured into regions:
 - `install` — lays down the file layout only: creates PROGRAM/DATA, writes the engine + template into DATA, creates `paths.txt` from the template if absent, copies `manager.ps1` into PROGRAM. It does not touch Vibepollo registration or the watchdog -- those are separate actions (the wizard simply calls all of them in sequence across its steps).
 - `register-vibepollo` — edit Vibepollo's `.conf`, add our entry with automatic backup
 - `unregister-vibepollo` — remove our entry from `.conf` (leaves the `.bak` file on disk for manual recovery; does not automatically restore from it)
-- `register-watchdog` — create scheduled tasks (Logon always; Poll with default interval or specified, opt-in). Never needs elevation -- every task registered is user-level.
-- `unregister-watchdog` — delete scheduled tasks (Logon, Poll), plus best-effort-remove a legacy Boot task if one is found. Never needs elevation for the current task set; the legacy Boot cleanup is attempted regardless but its failure never fails the overall call.
-- `uninstall` — cleanup: unregister-watchdog, unregister-vibepollo (if a conf path is known/found), restart the host service, remove the program folder (and the data folder if `-RemoveData` is passed)
+- `register-watchdog` — a full DESIRED-STATE reconciler for the two well-known tasks, not add-only: registers Logon by default (opt out with `-IncludeLogon:$false`) and/or Poll (opt-in, default interval or specified), AND unregisters whichever of Logon/Poll was not requested if it already exists. The Logon task's registration can prompt Windows for administrator approval even though its principal is always the calling user (see the Scheduled Tasks section above), and `Register-ScheduledTask -Force` runs unconditionally, so this can prompt on every call that (re-)registers Logon, not only the first. A poll-only registration (`-IncludeLogon:$false -IncludePoll`) does not itself attempt (and so does not itself prompt for) the Logon registration -- but the SAME call still removes an already-registered Logon task in that case, which can prompt if that removal is denied.
+- `unregister-watchdog` — delete scheduled tasks (Logon, Poll), plus best-effort-remove a legacy Boot task if one is found. Deleting a task you own generally does not need elevation the way registering the Logon trigger does, but a real failure is still surfaced as Success=$false and the GUI routes this through the same elevation-retry path as register-watchdog, defensively; the legacy Boot cleanup is attempted regardless but its failure never fails the overall call.
+- `uninstall` — cleanup: unregister-watchdog, unregister-vibepollo (if a conf path is known/found), restart the host service, remove the Start Menu/Desktop shortcuts if present (best-effort -- never fails the overall call), remove the program folder (and the data folder if `-RemoveData` is passed). The returned summary carries a top-level `Success` that is `$false` when the nested watchdog unregister failed (only that failure; a nested conf-edit failure stays a final business-logic outcome), so both the headless exit code and the GUI's elevation-retry offer can see it -- see #region Gui above.
 
-Supporting params (actual, as implemented): `-ProgramDir`, `-DataDir`, `-ConfPath`, `-IncludePoll`, `-PollMinutes`, `-RemoveData`, `-ManagerScriptPath`, `-UserId`, `-NoRun`. There is no `-IncludeBoot` -- the product has no boot-time task (see the Settle Mode section above). `-DataDir` is not user-changeable in the wizard (there is nowhere contract-compliant to persist a custom choice, since PROGRAM is fixed to hold `manager.ps1` only -- see the Install Layout contract above); it always resolves to the fixed default unless the param is passed explicitly (tests, elevation re-entry). `-ConfPath` falls back to a fresh `Find-HostConf` auto-detection when omitted.
+Supporting params (actual, as implemented): `-ProgramDir`, `-DataDir`, `-ConfPath`, `-IncludeLogon`, `-IncludePoll`, `-PollMinutes`, `-RemoveData`, `-DesktopDir`, `-ProgramsDir`, `-AddStartMenuShortcut`, `-AddDesktopShortcut`, `-ManagerScriptPath`, `-UserId`, `-NoRun`. `-DesktopDir`/`-ProgramsDir` (uninstall only) override the folders whose shortcut file gets removed, defaulting to `[Environment]::GetFolderPath('Desktop'/'Programs')`; the GUI resolves and passes these explicitly before an elevated uninstall retry, for the same over-the-shoulder-admin reason `-UserId` is. `-AddStartMenuShortcut`/`-AddDesktopShortcut` (install only) create the corresponding `.lnk` shortcut for `manager.ps1`; both default off headlessly (the wizard's own Done-step checkboxes default Start Menu checked / Desktop unchecked instead -- see Show-WizardDoneStep). `-IncludeLogon` defaults ON (every existing headless caller that doesn't say otherwise still gets Logon protection); it exists so a poll-only registration can skip the Logon task's registration attempt entirely rather than attempt-then-immediately-unregister it (which would otherwise prompt for elevation for a task the caller never wanted) -- it does NOT skip removing an already-registered Logon task, which `register-watchdog`'s desired-state reconcile still does in the same call when `-IncludeLogon:$false` is passed. There is no `-IncludeBoot` -- the product has no boot-time task (see the Settle Mode section above). `-DataDir` is not user-changeable in the wizard (there is nowhere contract-compliant to persist a custom choice, since PROGRAM is fixed to hold `manager.ps1` only -- see the Install Layout contract above); it always resolves to the fixed default unless the param is passed explicitly (tests, elevation re-entry). `-ConfPath` falls back to a fresh `Find-HostConf` auto-detection when omitted. `-UserId` defaults to a SID resolved from the current process when omitted (falling back to `DOMAIN\User`/`$env:USERNAME` where a SID isn't available -- see `Get-ResolvedUserId`), but the GUI always resolves and passes it explicitly before any elevation re-entry (see #region Gui above) so an elevated child launched under a *different* account never re-derives it from that account's own identity (a GUI that was itself launched already elevated is a separate case -- its own resolved identity already is the approving admin's).
+
+The elevation-argument boundary itself (`ConvertTo-ElevatedArgumentString`) renders every switch/bool parameter as an explicit `-Name:$true`/`-Name:$false` token, never a bare `-Name` for true and never silent omission for false: omission is only safe when the receiving parameter's own declared default already matches "absent", which does NOT hold for `-IncludeLogon` (declared default `$true`) -- an omitted `-IncludeLogon:$false` would otherwise bind to `$true` in the elevated child and silently re-register the Logon task the user had just declined.
 
 Running with no `-Action` opens the GUI (wizard on first run, main window if installed).
 
@@ -315,16 +340,27 @@ powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "<DA
 - `StreamConfigProfiles-Settle-Poll`: Repetition trigger (every N minutes), Interactive principal under the resolved user, configurable (min 5 minutes), default OFF
 
 There is no `StreamConfigProfiles-Settle-Boot` task -- see the Settle Mode section
-above ("No Boot task") for the architecture decision. Both remaining tasks are
-Interactive/user-level, so `register-watchdog`/`unregister-watchdog` never need
-elevation. `unregister-watchdog` still best-effort-attempts to delete a legacy
-`StreamConfigProfiles-Settle-Boot` task (present only if the user installed an
-interim build that registered one); that attempt's own success/failure never
-affects the overall result.
+above ("No Boot task") for the architecture decision. Both remaining tasks always
+RUN as an Interactive/user-level principal (never elevated). Registering that
+principal is a separate matter, though: real Windows requires administrator
+approval to `Register-ScheduledTask` a logon-type trigger (Logon's `AtLogOn` +
+session-unlock) even though the principal being registered is the calling user
+themself, so `register-watchdog` can prompt for elevation whenever it (re-)registers
+the Logon task -- not only the first time, since registration is unconditional
+(`-Force`) on every call -- the GUI's `Invoke-GuiElevatable` handles the
+confirm-and-retry for that case (see #region Gui above). The Poll task's repetition
+trigger carries no such requirement, so a poll-only registration does not itself
+attempt (and so does not itself prompt for) the Logon registration; the same call
+can still prompt if it also needs to remove an already-registered, possibly
+admin-owned Logon task (see `register-watchdog`'s desired-state reconcile above).
+`unregister-watchdog`
+still best-effort-attempts to delete a legacy `StreamConfigProfiles-Settle-Boot`
+task (present only if the user installed an interim build that registered one);
+that attempt's own success/failure never affects the overall result.
 
 ### Release Pipeline
 
 1. Build: Inline `sync-configs.ps1` and `paths.example.txt` into `manager.ps1` payload slots → `dist/manager.ps1`
-2. Generate `Install.bat`: wrapper that sets execution policy and runs the wizard
-3. Package for release: `manager.ps1`, `Install.bat`, README snippet (quick-start)
+2. Generate `StreamConfigProfiles-Setup.bat`: polyglot batch/PowerShell single-file installer (batch header + marker + PS1 payload)
+3. Package for release: `StreamConfigProfiles-Setup.bat` (primary), `manager.ps1` (for auditors), `SHA256SUMS.txt` (hashes of both, generated by the release job)
 4. CI/CD: matrix across Windows PowerShell 5.1 + pwsh 7, verify both payload modes (dev + release)
