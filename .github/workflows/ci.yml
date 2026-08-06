@@ -6,6 +6,13 @@ on:
     branches:
       - main
 
+# Successive pushes to the same PR/branch cancel the previous in-flight run --
+# the Windows legs bill 2x, so stale runs left running to completion are the
+# main minutes sink here.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: ${{ matrix.name }}
