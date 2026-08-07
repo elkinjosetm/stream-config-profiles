@@ -41,6 +41,8 @@ The tool uses a two-phase strategy designed to survive crashes and unexpected di
    - **Done**: Start Menu shortcut created by default (optional Desktop shortcut available)
 3. **Done** — your next stream will use the profiles automatically. Afterwards, add/remove game config paths from the Main Window (Add File/Add Folder). Reopen it any time using the Start Menu shortcut, or optionally the Desktop shortcut if you created one during setup.
 
+**Updating:** download a newer `StreamConfigProfiles-Setup.bat` and run it again — it updates your existing installation in place (paths, profiles, and connection are all preserved) instead of reinstalling from scratch; see install.md's "Updating" section for details.
+
 ## File Locations
 
 - **Program file**: `%LOCALAPPDATA%\Programs\stream-config-profiles\manager.ps1` (the GUI app)

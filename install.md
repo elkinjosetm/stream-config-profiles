@@ -156,6 +156,20 @@ If case (a) works as expected, installation is complete! Case (b) is just there 
 
 ---
 
+## Updating
+
+### If You Used Method A (the App)
+
+Download the latest `StreamConfigProfiles-Setup.bat` and run it again — no need to uninstall first, and no wizard reappears. The app detects your existing installation automatically and updates it in place: your configured game paths, saved profiles, watchdog settings, and Vibepollo/Apollo connection are all preserved untouched. Any Start Menu/Desktop shortcut you already have is refreshed to the current shortcut definition too (so an older shortcut that opened a visible console window, for example, starts opening silently again) — a shortcut you never created is never added. You'll see a brief "Installation updated to this version." notice, then the Main Window opens as usual.
+
+> **Note:** this update check compares file *contents*, not version numbers — it does not know which copy is actually newer. Running an **older** `StreamConfigProfiles-Setup.bat` (or an older standalone `manager.ps1`) against a newer installation will overwrite it the same way, silently downgrading `manager.ps1`/`sync-configs.ps1`/`paths.example.txt`. Always grab Setup.bat from the current release if you're not sure which one you have.
+
+### If You Used Method B (Manual Setup)
+
+Re-download or `git pull` the repo, then copy the updated `sync-configs.ps1` over your existing copy at the same path. Your `paths.txt` and the Command Preparations entry in Vibepollo/Apollo don't need to change. Re-run the checks in Step 4 (Verify Installation Works) to confirm the update took effect.
+
+---
+
 ## Uninstalling
 
 ### If You Used Method A (the App)

@@ -275,6 +275,292 @@ Invoke-Scenario -Name 'Install-App: re-install is idempotent -- upgrades engine/
 } | Out-Null
 
 # ===========================================================================
+# Upgrade detection: running a newer Setup.bat/manager.ps1 against an
+# existing installation must actually upgrade it (see Get-ManagerUpgrade-
+# Decision / Test-ManagerUpgradeNeeded / Update-ManagerInstallationInPlace /
+# Invoke-ManagerAutoUpgrade).
+# ===========================================================================
+
+Invoke-Scenario -Name 'Upgrade detection: Get-ManagerUpgradeDecision -- running FROM the installed copy (same path) is never an upgrade, even with different content' -Body {
+    $decision = Get-ManagerUpgradeDecision -RunningScriptPath 'C:\Program Files\App\manager.ps1' -InstalledManagerPath 'C:\Program Files\App\manager.ps1' -InstalledManagerExists $true -RunningScriptContent 'OLD' -InstalledManagerContent 'NEW'
+    Assert-That ($decision -eq $false) 'identical (resolved, case-insensitive) paths must never trigger an upgrade -- that IS the installed copy'
+
+    # Case-insensitive path comparison (Windows paths).
+    $decisionCaseInsensitive = Get-ManagerUpgradeDecision -RunningScriptPath 'C:\Program Files\App\manager.ps1' -InstalledManagerPath 'c:\program files\app\MANAGER.PS1' -InstalledManagerExists $true -RunningScriptContent 'OLD' -InstalledManagerContent 'NEW'
+    Assert-That ($decisionCaseInsensitive -eq $false) 'path comparison should be case-insensitive'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Get-ManagerUpgradeDecision -- identical content from a different path is a no-op' -Body {
+    $decision = Get-ManagerUpgradeDecision -RunningScriptPath '/tmp/scp_abc/manager.ps1' -InstalledManagerPath 'C:\Program Files\App\manager.ps1' -InstalledManagerExists $true -RunningScriptContent 'SAME CONTENT' -InstalledManagerContent 'SAME CONTENT'
+    Assert-That ($decision -eq $false) 'identical content should never trigger an upgrade, regardless of path'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Get-ManagerUpgradeDecision -- different content, running from outside PROGRAM -> upgrade' -Body {
+    $decision = Get-ManagerUpgradeDecision -RunningScriptPath '/tmp/scp_abc/manager.ps1' -InstalledManagerPath 'C:\Program Files\App\manager.ps1' -InstalledManagerExists $true -RunningScriptContent 'NEW VERSION' -InstalledManagerContent 'OLD VERSION'
+    Assert-That ($decision -eq $true) 'different content while running from outside PROGRAM must trigger an upgrade -- this is the Setup.bat-from-%TEMP% field scenario'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Get-ManagerUpgradeDecision -- no installed copy at all is never an upgrade (nothing to upgrade)' -Body {
+    $decision = Get-ManagerUpgradeDecision -RunningScriptPath '/tmp/scp_abc/manager.ps1' -InstalledManagerPath 'C:\Program Files\App\manager.ps1' -InstalledManagerExists $false -RunningScriptContent 'NEW VERSION' -InstalledManagerContent $null
+    Assert-That ($decision -eq $false) 'a missing installed copy must never crash or trigger an upgrade -- there is nothing there to upgrade'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Test-ManagerUpgradeNeeded (disk-facing) -- real files, all three decision branches' -Body {
+    $sbx = New-Sbx -Label 'upgrade-needed-disk'
+    $programDir = Join-Path $sbx 'program'
+    New-Item -ItemType Directory -Path $programDir -Force | Out-Null
+    $installedManagerPath = Join-Path $programDir 'manager.ps1'
+    Write-TextFile -Path $installedManagerPath -Content 'OLD MANAGER CONTENT'
+
+    # Same path as the installed copy -> no upgrade regardless of content.
+    Assert-That ((Test-ManagerUpgradeNeeded -RunningScriptPath $installedManagerPath -ProgramDir $programDir) -eq $false) 'running the installed copy itself must never be treated as an upgrade'
+
+    # Different path, identical content -> no upgrade.
+    $sameContentPath = Join-Path $sbx 'same-content-manager.ps1'
+    Write-TextFile -Path $sameContentPath -Content 'OLD MANAGER CONTENT'
+    Assert-That ((Test-ManagerUpgradeNeeded -RunningScriptPath $sameContentPath -ProgramDir $programDir) -eq $false) 'identical content from elsewhere on disk must not trigger an upgrade'
+
+    # Different path, different content -> upgrade.
+    $newerPath = Join-Path $sbx 'newer-manager.ps1'
+    Write-TextFile -Path $newerPath -Content 'NEW MANAGER CONTENT'
+    Assert-That ((Test-ManagerUpgradeNeeded -RunningScriptPath $newerPath -ProgramDir $programDir) -eq $true) 'different content from a different (outside-PROGRAM) path must trigger an upgrade'
+
+    # No installed copy at all -> no upgrade, never throws.
+    $freshProgramDir = Join-Path $sbx 'program-not-installed-yet'
+    Assert-That ((Test-ManagerUpgradeNeeded -RunningScriptPath $newerPath -ProgramDir $freshProgramDir) -eq $false) 'a ProgramDir with no manager.ps1 at all must not throw and must not report an upgrade'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Update-ManagerInstallationInPlace performs the real upgrade (Install-App) and rewrites only shortcuts that already exist' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'upgrade-inplace'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    $desktopDir = Join-Path $sbx 'desktop'
+    $programsDir = Join-Path $sbx 'startmenu'
+
+    # Simulate an existing (older) installation.
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    # Simulate a pre-launch.vbs Start Menu shortcut that already exists on
+    # disk (the field symptom: it must be REWRITTEN, not left stale) --
+    # only the Start Menu one exists; Desktop was never created (the
+    # user's original choice, which must be respected -- no Desktop
+    # shortcut should be created by the upgrade).
+    $startMenuLnk = Join-Path $programsDir 'Stream Config Profiles.lnk'
+    Write-TextFile -Path $startMenuLnk -Content 'stale shortcut placeholder'
+    $desktopLnk = Join-Path $desktopDir 'Stream Config Profiles.lnk'
+    Assert-That (-not (Test-Path -LiteralPath $desktopLnk)) 'sanity: the Desktop shortcut must not exist yet'
+
+    # Simulate a NEWER running script (e.g. Setup.bat's %TEMP%-extracted
+    # copy) with different content than what got installed above.
+    $newerRunningScript = Join-Path $sbx 'newer-manager.ps1'
+    $originalManagerContent = Read-TextFile $script:ManagerScriptSource
+    Write-TextFile -Path $newerRunningScript -Content ($originalManagerContent + "`n# newer build marker`n")
+
+    Update-ManagerInstallationInPlace -RunningManagerScriptPath $newerRunningScript -ProgramDir $programDir -DataDir $dataDir -ScriptDir $script:RepoRoot -DesktopDir $desktopDir -ProgramsDir $programsDir
+
+    # Install-App must have actually re-run: PROGRAM\manager.ps1 now
+    # matches the newer running script, not the original install.
+    $installedManagerContent = Read-TextFile (Join-Path $programDir 'manager.ps1')
+    Assert-That ($installedManagerContent -eq (Read-TextFile $newerRunningScript)) 'PROGRAM\manager.ps1 should be refreshed to match the newer running script'
+
+    # Only the EXISTING (Start Menu) shortcut should have been rewritten;
+    # no Desktop shortcut should have been created.
+    Assert-That ($script:ShortcutCalls.Count -eq 1) "expected exactly 1 shortcut rewrite (Start Menu only, since it already existed), got $($script:ShortcutCalls.Count)"
+    if ($script:ShortcutCalls.Count -eq 1) {
+        Assert-That ($script:ShortcutCalls[0].ShortcutPath -eq $startMenuLnk) 'the one shortcut rewritten should be the pre-existing Start Menu one'
+        Assert-That ($script:ShortcutCalls[0].Definition.TargetPath -match 'wscript') 'the rewritten shortcut should target wscript.exe (the current launch.vbs indirection), not powershell.exe directly'
+    }
+    Assert-That (-not (Test-Path -LiteralPath $desktopLnk)) 'Update-ManagerInstallationInPlace must never CREATE a Desktop shortcut the user never had'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Update-ManagerInstallationInPlace creates no shortcuts at all when neither location already exists' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'upgrade-inplace-no-shortcuts'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    $desktopDir = Join-Path $sbx 'desktop'
+    $programsDir = Join-Path $sbx 'startmenu'
+
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    Update-ManagerInstallationInPlace -RunningManagerScriptPath $script:ManagerScriptSource -ProgramDir $programDir -DataDir $dataDir -ScriptDir $script:RepoRoot -DesktopDir $desktopDir -ProgramsDir $programsDir
+
+    Assert-That ($script:ShortcutCalls.Count -eq 0) 'no shortcut file exists at either location -- the upgrade must not create one (respect the original no-shortcut choice)'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Invoke-ManagerAutoUpgrade routes both the decision check and the upgrade itself through Invoke-GuiSafe (never throws, never blocks the Main Window)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Invoke-ManagerAutoUpgrade \{.*?\n\}\r?\n\r?\nfunction Show-ManagerGui')
+    Assert-That $body.Success 'sanity: should be able to locate Invoke-ManagerAutoUpgrade''s body'
+
+    Assert-That ($body.Value -match [regex]::Escape('Invoke-GuiSafe -Action { Test-ManagerUpgradeNeeded')) 'the upgrade-needed check should run through Invoke-GuiSafe, not a bare call that could throw'
+    Assert-That ($body.Value -match [regex]::Escape('Invoke-GuiSafe -Action {') -and $body.Value -match [regex]::Escape('Update-ManagerInstallationInPlace')) 'the actual upgrade (Install-App + shortcut refresh) should run through Invoke-GuiSafe'
+    Assert-That (-not ($body.Value -match 'throw ')) 'Invoke-ManagerAutoUpgrade itself should never throw -- any failure must be swallowed by Invoke-GuiSafe so Show-ManagerGui can still open the Main Window'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: Show-ManagerGui only auto-upgrades on the Main Window path, never before the First-Run Wizard' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Show-ManagerGui \{.*?\n\}\r?\n\r?\n# =')
+    Assert-That $body.Success 'sanity: should be able to locate Show-ManagerGui''s body'
+
+    $wizardBranch = [regex]::Match($body.Value, '(?s)if\s*\(-not\s*\$engineInstalled\)\s*\{.*?\}\r?\n\s*else\s*\{(.*?)\}\r?\n\s*\}\r?\n\s*catch')
+    Assert-That $wizardBranch.Success 'sanity: should be able to locate the engineInstalled if/else branches'
+
+    $ifBranchText = [regex]::Match($body.Value, '(?s)if\s*\(-not\s*\$engineInstalled\)\s*\{(.*?)\}\r?\n\s*else')
+    Assert-That $ifBranchText.Success 'sanity: should be able to isolate the First-Run Wizard branch'
+    Assert-That (-not ($ifBranchText.Groups[1].Value -match 'Invoke-ManagerAutoUpgrade')) 'the First-Run Wizard branch must never call Invoke-ManagerAutoUpgrade -- there is nothing installed yet'
+
+    Assert-That ($wizardBranch.Groups[1].Value -match 'Invoke-ManagerAutoUpgrade') 'the Main Window (else) branch must call Invoke-ManagerAutoUpgrade before Show-MainWindow'
+    $upgradeIndex = $wizardBranch.Groups[1].Value.IndexOf('Invoke-ManagerAutoUpgrade')
+    $showMainIndex = $wizardBranch.Groups[1].Value.IndexOf('Show-MainWindow')
+    Assert-That ($upgradeIndex -ge 0 -and $showMainIndex -ge 0 -and $upgradeIndex -lt $showMainIndex) 'Invoke-ManagerAutoUpgrade must run BEFORE Show-MainWindow opens'
+} | Out-Null
+
+Invoke-Scenario -Name 'Upgrade detection: the headless -Action dispatch never reaches the auto-upgrade path (source-level)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+
+    $actionBody = [regex]::Match($source, '(?s)function Invoke-ManagerAction \{.*?\nfunction Test-ManagerResultIndicatesFailure')
+    Assert-That $actionBody.Success 'sanity: should be able to locate Invoke-ManagerAction''s body'
+    Assert-That (-not ($actionBody.Value -match 'Invoke-ManagerAutoUpgrade')) 'Invoke-ManagerAction (the headless -Action dispatcher) must never call Invoke-ManagerAutoUpgrade'
+    Assert-That (-not ($actionBody.Value -match 'Show-ManagerGui')) 'Invoke-ManagerAction (the headless -Action dispatcher) must never call Show-ManagerGui either'
+
+    # The bottom CLI dispatch: Show-ManagerGui (the only path that can reach
+    # Invoke-ManagerAutoUpgrade) must be gated behind "no -Action given",
+    # mutually exclusive with the -Action -> Invoke-ManagerAction branch.
+    $dispatchBody = [regex]::Match($source, '(?s)if \(-not \[string\]::IsNullOrWhiteSpace\(\$Action\)\) \{(.*?)\r?\n    \}\r?\n    else \{(.*?)\r?\n    \}\r?\n\}\r?\n\z')
+    Assert-That $dispatchBody.Success 'sanity: should be able to locate the bottom Action/no-Action CLI dispatch'
+    Assert-That ($dispatchBody.Groups[1].Value -match 'Invoke-ManagerAction') 'the -Action branch should call Invoke-ManagerAction'
+    Assert-That (-not ($dispatchBody.Groups[1].Value -match 'Show-ManagerGui')) 'the -Action branch must never call Show-ManagerGui (and therefore never Invoke-ManagerAutoUpgrade)'
+    Assert-That ($dispatchBody.Groups[2].Value -match 'Show-ManagerGui') 'the no-Action (GUI) branch should call Show-ManagerGui'
+} | Out-Null
+
+# ===========================================================================
+# Auto-upgrade path repointing (SECURITY): mirrors the wizard's own
+# Show-WizardInstallStep -> $State.ManagerScriptPath = $r.ManagerPath fix
+# (pinned above at "a successful install repoints State.ManagerScriptPath").
+# Without this, every elevation the Main Window can perform after an
+# auto-upgrade (register/unregister-watchdog, Disconnect/Uninstall, Connect)
+# would keep re-elevating against the pre-upgrade running path -- a
+# %TEMP%\scp_<guid>\manager.ps1 extraction when launched via Setup.bat,
+# writable by any other process on the box for as long as this GUI runs.
+# ===========================================================================
+
+Invoke-Scenario -Name 'Update-ManagerInstallationInPlace: returns Install-App''s own result object (not discarded), so callers can read .ManagerPath' -Body {
+    $sbx = New-Sbx -Label 'upgrade-inplace-return-value'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    $desktopDir = Join-Path $sbx 'desktop'
+    $programsDir = Join-Path $sbx 'startmenu'
+
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    $result = Update-ManagerInstallationInPlace -RunningManagerScriptPath $script:ManagerScriptSource -ProgramDir $programDir -DataDir $dataDir -ScriptDir $script:RepoRoot -DesktopDir $desktopDir -ProgramsDir $programsDir
+
+    $expectedManagerPath = Join-Path $programDir 'manager.ps1'
+    Assert-That ($null -ne $result) 'Update-ManagerInstallationInPlace should return a value, not discard Install-App''s result'
+    Assert-That ($result.ManagerPath -eq $expectedManagerPath) "Update-ManagerInstallationInPlace's return value should expose .ManagerPath = $expectedManagerPath (got '$($result.ManagerPath)') -- this is what Invoke-ManagerAutoUpgrade needs to repoint ManagerScriptPath at PROGRAM after a successful upgrade"
+} | Out-Null
+
+Invoke-Scenario -Name 'Update-ManagerInstallationInPlace: a shortcut refresh failure at one location is best-effort -- the other location still refreshes and the function still returns normally' -Body {
+    $script:ShortcutCalls.Clear()
+    $sbx = New-Sbx -Label 'upgrade-inplace-shortcut-best-effort'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    $desktopDir = Join-Path $sbx 'desktop'
+    $programsDir = Join-Path $sbx 'startmenu'
+
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+
+    # Both shortcut locations already exist on disk (both must be
+    # considered for refresh)...
+    $desktopLnk = Join-Path $desktopDir 'Stream Config Profiles.lnk'
+    Write-TextFile -Path $desktopLnk -Content 'stale desktop shortcut placeholder'
+    $startMenuLnk = Join-Path $programsDir 'Stream Config Profiles.lnk'
+    Write-TextFile -Path $startMenuLnk -Content 'stale start menu shortcut placeholder'
+
+    # ...but the Desktop one is simulated as locked/read-only (New-ShortcutFile
+    # throws for it specifically, exactly like New-ManagerShortcut's own
+    # per-location failure scenario above).
+    $script:ShortcutCreateShouldThrowFor = @($desktopLnk)
+    try {
+        $result = $null
+        $threw = $false
+        try {
+            $result = Update-ManagerInstallationInPlace -RunningManagerScriptPath $script:ManagerScriptSource -ProgramDir $programDir -DataDir $dataDir -ScriptDir $script:RepoRoot -DesktopDir $desktopDir -ProgramsDir $programsDir
+        }
+        catch {
+            $threw = $true
+        }
+
+        Assert-That (-not $threw) 'a single shortcut-location failure must never propagate out of Update-ManagerInstallationInPlace (best-effort, exactly like New-ManagerShortcut''s own per-location try/catch)'
+        Assert-That ($null -ne $result -and $result.ManagerPath -eq (Join-Path $programDir 'manager.ps1')) 'Install-App''s own result must still be returned even when a later shortcut refresh fails'
+
+        $startMenuCall = @($script:ShortcutCalls | Where-Object { $_.ShortcutPath -eq $startMenuLnk })
+        Assert-That (@($startMenuCall).Count -eq 1) 'the Start Menu shortcut (the one that did NOT fail) must still have been refreshed despite the Desktop one throwing'
+    }
+    finally {
+        $script:ShortcutCreateShouldThrowFor = @()
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Invoke-ManagerAutoUpgrade: returns the original running path unchanged when no upgrade is needed (safe to call live -- never reaches the WinForms-only success path)' -Body {
+    $sbx = New-Sbx -Label 'auto-upgrade-no-upgrade-needed'
+    $programDir = Join-Path $sbx 'program'
+    $dataDir = Join-Path $sbx 'data'
+    Install-App -ProgramDir $programDir -DataDir $dataDir -ManagerScriptPath $script:ManagerScriptSource -ScriptDir $script:RepoRoot | Out-Null
+    $installedManagerPath = Join-Path $programDir 'manager.ps1'
+
+    # Running FROM the installed copy itself -- Get-ManagerUpgradeDecision's
+    # path-equality guard means no upgrade is needed, so this returns before
+    # ever reaching the MessageBox-showing success branch (unreachable on
+    # this headless Linux host, which has no System.Windows.Forms at all).
+    $returnedPath = Invoke-ManagerAutoUpgrade -RunningManagerScriptPath $installedManagerPath -ProgramDir $programDir -DataDir $dataDir -ScriptDir $script:RepoRoot
+    Assert-That ($returnedPath -eq $installedManagerPath) 'running from the installed copy itself needs no upgrade, so the path should be returned unchanged'
+} | Out-Null
+
+Invoke-Scenario -Name 'Invoke-ManagerAutoUpgrade (source-level): the success branch repoints its return value at Update-ManagerInstallationInPlace''s own ManagerPath, not the pre-upgrade running path' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Invoke-ManagerAutoUpgrade \{.*?\n\}\r?\n\r?\nfunction Show-ManagerGui')
+    Assert-That $body.Success 'sanity: should be able to locate Invoke-ManagerAutoUpgrade''s body'
+
+    Assert-That ($body.Value -match [regex]::Escape('return $RunningManagerScriptPath')) 'Invoke-ManagerAutoUpgrade should fall back to returning the path it was given (no upgrade needed, or the upgrade failed)'
+    Assert-That ($body.Value -match [regex]::Escape('$upgradeOutcome.Value.ManagerPath')) 'the success branch should read .ManagerPath off Update-ManagerInstallationInPlace''s own return value'
+    $returnManagerPathIndex = $body.Value.IndexOf('return [string]$upgradeOutcome.Value.ManagerPath')
+    Assert-That ($returnManagerPathIndex -ge 0) 'a successful upgrade should return the freshly-written PROGRAM manager path, not fall through to the pre-upgrade path'
+} | Out-Null
+
+Invoke-Scenario -Name 'Show-ManagerGui (source-level): captures Invoke-ManagerAutoUpgrade''s return value and hands THAT to Show-MainWindow -- not the pre-upgrade $resolvedManagerScriptPath directly' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Show-ManagerGui \{.*?\n\}\r?\n\r?\n# =')
+    Assert-That $body.Success 'sanity: should be able to locate Show-ManagerGui''s body'
+
+    Assert-That ($body.Value -match [regex]::Escape('Invoke-ManagerAutoUpgrade -RunningManagerScriptPath $resolvedManagerScriptPath')) 'Invoke-ManagerAutoUpgrade should still be called with the running script''s own resolved path'
+    Assert-That ($body.Value -match '\$\w+\s*=\s*Invoke-ManagerAutoUpgrade\b') 'Invoke-ManagerAutoUpgrade''s return value must be captured into a variable, not discarded, so a successful auto-upgrade can repoint the path used afterward'
+    Assert-That (-not ($body.Value -match [regex]::Escape('Show-MainWindow -ScriptDir $resolvedScriptDir -ProgramDir $resolvedProgramDir -DataDir $resolvedDataDir -ManagerScriptPath $resolvedManagerScriptPath'))) 'Show-MainWindow must not be called with the pre-upgrade $resolvedManagerScriptPath directly any more -- it must use Invoke-ManagerAutoUpgrade''s (possibly repointed) return value instead'
+} | Out-Null
+
+# ===========================================================================
+# Install-App atomicity ordering: PROGRAM (manager.ps1/launch.vbs) is
+# written before DATA (engine/template), so a mid-Install-App failure never
+# leaves PROGRAM pointing at a manager.ps1 that is older than what
+# Get-ManagerUpgradeDecision would have already treated as "no upgrade
+# needed" on the next launch (see Install-App's own comment for the full
+# failure-mode analysis).
+# ===========================================================================
+
+Invoke-Scenario -Name 'Install-App (source-level): PROGRAM\manager.ps1 is written before DATA\sync-configs.ps1' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function Install-App \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $body.Success 'sanity: should be able to locate Install-App''s body'
+
+    $managerWriteIndex = $body.Value.IndexOf("Join-Path `$ProgramDir 'manager.ps1'")
+    $engineWriteIndex = $body.Value.IndexOf("Join-Path `$DataDir 'sync-configs.ps1'")
+    Assert-That ($managerWriteIndex -ge 0 -and $engineWriteIndex -ge 0) 'sanity: should be able to locate both destination-path computations'
+    Assert-That ($managerWriteIndex -lt $engineWriteIndex) 'PROGRAM\manager.ps1 (and launch.vbs, written right after it) must be written before DATA\sync-configs.ps1 -- a failure partway through must never leave PROGRAM stale while DATA already reflects the new version'
+} | Out-Null
+
+# ===========================================================================
 # global_prep_cmd conf round-trip
 # ===========================================================================
 
@@ -2474,6 +2760,208 @@ Invoke-Scenario -Name 'DPI awareness: every Form the app creates goes through Ne
 
     $formFactorySites = @([regex]::Matches($source, '\$form\s*=\s*New-GuiForm\b'))
     Assert-That (@($formFactorySites).Count -ge 7) "expected at least 7 '`$form = New-GuiForm' call sites (5 wizard steps + the Connect dialog + the Main Window), found $(@($formFactorySites).Count)"
+} | Out-Null
+
+# ===========================================================================
+# Adaptive/DPI-proof layout -- field feedback: fixed pixel Width boxes on
+# buttons/labels/checkboxes cropped their text once DPI-scaled 9pt Segoe UI
+# (see New-GuiForm) no longer fit the box ('Connect/Reconnect...' rendered
+# as 'Connect/Reconne', a 'Logon/Unlock' checkbox as 'Logon/Unl', etc.), and
+# only the Main Window's paths ListBox ever grew on resize/maximize (and
+# only sideways), leaving every other control frozen top-left with the rest
+# of the window's new space unused. Every scenario below is source-level
+# (regex over the raw script text), same as the DPI-awareness scenarios
+# above -- actual crisp/uncropped/reflowing rendering can only be confirmed
+# by eye on a real high-DPI Windows display, which this headless Linux
+# harness cannot do.
+# ===========================================================================
+
+Invoke-Scenario -Name 'Adaptive layout: New-GuiButton is AutoSize (GrowAndShrink) and never assigns a fixed .Size/.Width, so button text can never crop' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function New-GuiButton \{.*?\n\}\r?\n\r?\nfunction New-GuiFlowRow')
+    Assert-That $body.Success 'sanity: should be able to locate New-GuiButton''s body'
+
+    Assert-That ($body.Value -match [regex]::Escape('$btn.AutoSize = $true')) 'New-GuiButton should set AutoSize = $true'
+    Assert-That ($body.Value -match [regex]::Escape('[System.Windows.Forms.AutoSizeMode]::GrowAndShrink')) 'New-GuiButton should set AutoSizeMode to GrowAndShrink'
+    Assert-That (-not ($body.Value -match '\$btn\.Size\s*=')) 'New-GuiButton must never assign a fixed .Size -- that is exactly the field-reported crop bug (a pixel box too small for DPI-scaled text)'
+    Assert-That (-not ($body.Value -match '\$btn\.Width\s*=')) 'New-GuiButton must never assign a fixed .Width'
+    Assert-That (-not ($body.Value -match '(?m)^\s*param\(.*\$Width')) 'New-GuiButton should not even accept a -Width parameter any more (every call site was migrated off it)'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: no call site anywhere in the file passes -Width to New-GuiButton' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $widthCallSites = @([regex]::Matches($source, 'New-GuiButton[^\r\n]*-Width'))
+    Assert-That (@($widthCallSites).Count -eq 0) "expected zero New-GuiButton call sites passing -Width, found $(@($widthCallSites).Count) -- every button now sizes itself via AutoSize instead"
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: no fixed .Width/.Size assignment remains on any button variable in the Gui region (NumericUpDown/status TextBoxes are exempt)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    # Every button in the file is stored in a $btn*-prefixed variable
+    # (btnCancel, btnConnectVibepollo, btnApplyWatchdog, ...) -- this scans
+    # the WHOLE file (not just one function) for any of them being given a
+    # fixed .Width or .Size afterward, which would silently reintroduce a
+    # DPI crop risk even if New-GuiButton itself stays AutoSize.
+    $fixedSites = @([regex]::Matches($source, '\$btn\w*\.(Width|Size)\s*='))
+    Assert-That (@($fixedSites).Count -eq 0) "expected zero fixed .Width/.Size assignments on any `$btn* variable, found $(@($fixedSites).Count)"
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: New-GuiLabel and New-GuiCheckBox are AutoSize (a wrap-width ceiling, not a hard clipping box)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+
+    $labelBody = [regex]::Match($source, '(?s)function New-GuiLabel \{.*?\n\}\r?\n\r?\nfunction New-GuiButton')
+    Assert-That $labelBody.Success 'sanity: should be able to locate New-GuiLabel''s body'
+    Assert-That ($labelBody.Value -match [regex]::Escape('$lbl.AutoSize = $true')) 'New-GuiLabel should set AutoSize = $true'
+    Assert-That ($labelBody.Value -match [regex]::Escape('$lbl.MaximumSize = New-Object System.Drawing.Size($Width, 0)')) 'New-GuiLabel should use -Width as a MaximumSize wrap ceiling, not a hard Size'
+    Assert-That (-not ($labelBody.Value -match '\$lbl\.Size\s*=')) 'New-GuiLabel must never assign a fixed .Size any more'
+
+    $checkboxBody = [regex]::Match($source, '(?s)function New-GuiCheckBox \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $checkboxBody.Success 'sanity: should be able to locate New-GuiCheckBox''s body'
+    Assert-That ($checkboxBody.Value -match [regex]::Escape('$cb.AutoSize = $true')) 'New-GuiCheckBox should set AutoSize = $true'
+    Assert-That (-not ($checkboxBody.Value -match '\$cb\.Size\s*=')) 'New-GuiCheckBox must never assign a fixed .Size any more'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: New-GuiFlowRow builds a non-wrapping, AutoSize FlowLayoutPanel shared by every button row in the app' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $body = [regex]::Match($source, '(?s)function New-GuiFlowRow \{.*?\n\}\r?\n\r?\nfunction New-GuiTextBox')
+    Assert-That $body.Success 'sanity: should be able to locate New-GuiFlowRow''s body'
+
+    Assert-That ($body.Value -match [regex]::Escape('New-Object System.Windows.Forms.FlowLayoutPanel')) 'New-GuiFlowRow should build a FlowLayoutPanel'
+    Assert-That ($body.Value -match [regex]::Escape('$flow.WrapContents = $false')) 'a button row must never silently wrap a button onto an invisible second line'
+    Assert-That ($body.Value -match [regex]::Escape('$flow.AutoSize = $true')) 'New-GuiFlowRow should be AutoSize'
+    Assert-That ($body.Value -match [regex]::Escape('[System.Windows.Forms.AutoSizeMode]::GrowAndShrink')) 'New-GuiFlowRow should use AutoSizeMode GrowAndShrink'
+
+    # Used by every wizard step, the Connect dialog, AND the Main Window --
+    # not just a helper only the Main Window happens to call.
+    $callSites = @([regex]::Matches($source, 'New-GuiFlowRow\s+-Controls'))
+    Assert-That (@($callSites).Count -ge 10) "expected at least 10 New-GuiFlowRow call sites (every wizard step's nav row(s) + the Connect dialog's two rows + the Main Window's four button rows), found $(@($callSites).Count)"
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: Show-MainWindow builds a root, one-column TableLayoutPanel docked to fill the window' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+
+    Assert-That ($windowBody.Value -match [regex]::Escape('$root = New-Object System.Windows.Forms.TableLayoutPanel')) 'Show-MainWindow should build a root TableLayoutPanel'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$root.Dock = [System.Windows.Forms.DockStyle]::Fill')) 'the root TableLayoutPanel should be Dock = Fill'
+    Assert-That ($windowBody.Value -match '\$root\.ColumnCount\s*=\s*1') 'the root TableLayoutPanel should be a single column'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$form.Controls.Add($root)')) 'the root TableLayoutPanel should actually be added to the form'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: the paths ListBox''s row is the one Percent(100) row (grows both directions); every other row is AutoSize' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+
+    Assert-That ($windowBody.Value -match '(?s)if\s*\(\$rowIndex\s*-eq\s*\$rowPathsList\)\s*\{\s*\$root\.RowStyles\.Add\(\(New-Object System\.Windows\.Forms\.RowStyle\(\[System\.Windows\.Forms\.SizeType\]::Percent,\s*100\)\)\)') 'the paths ListBox row should get a Percent(100) RowStyle'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))')) 'every other row should get an AutoSize RowStyle'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$lstPaths.Dock = [System.Windows.Forms.DockStyle]::Fill')) 'the paths ListBox itself should Dock = Fill so it actually claims the Percent row''s space in both directions'
+    Assert-That (-not ($windowBody.Value -match [regex]::Escape('$lstPaths.Anchor = ''Top,Left,Right'''))) 'the old Anchor-only (width-but-not-height) growth should be gone, replaced by Dock = Fill inside a Percent row'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: every button row in the Main Window (paths/connect/watchdog/bottom) is a New-GuiFlowRow, not loose Controls.Add calls' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+
+    Assert-That ($windowBody.Value -match [regex]::Escape('$pathsButtonsRow = New-GuiFlowRow -Controls @($btnAddFile, $btnAddFolder, $btnRemove)')) 'the Add File/Add Folder/Remove Selected row should be one New-GuiFlowRow'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$connectButtonRow = New-GuiFlowRow -Controls @($btnConnectVibepollo)')) 'the Connect/Reconnect... row should be a New-GuiFlowRow'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$watchdogControlsRow = New-GuiFlowRow -Controls @($cbLogon2, $cbPoll2, $nudPoll2, $lblMin2, $btnApplyWatchdog, $btnUnregisterWatchdog)')) 'the watchdog checkboxes/NumericUpDown/label/buttons should be one New-GuiFlowRow'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$bottomButtonsRow = New-GuiFlowRow -Controls @($btnOpenData, $btnViewLog, $btnDisconnect)')) 'the bottom Open data folder/View sync.log/Disconnect row should be one New-GuiFlowRow'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: Show-MainWindow computes $form.MinimumSize from the root panel''s own PreferredSize, not a hardcoded pixel constant' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+
+    Assert-That ($windowBody.Value -match [regex]::Escape('$contentPreferredSize = $root.GetPreferredSize([System.Drawing.Size]::Empty)')) 'MinimumSize should be derived from the root panel''s GetPreferredSize'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$form.MinimumSize = New-Object System.Drawing.Size(($contentPreferredSize.Width + $chromeWidth), ($contentPreferredSize.Height + $chromeHeight))')) 'MinimumSize should combine the content''s preferred size with the form''s own chrome (title bar/borders)'
+    Assert-That (-not ($windowBody.Value -match [regex]::Escape('$form.MinimumSize = New-Object System.Drawing.Size(560, 580)'))) 'the old hardcoded MinimumSize constant (a guess that only happened to fit at 96 DPI) should be gone'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout (DOUBLE-SCALING FIX): Show-MainWindow''s MinimumSize/Size measurement runs inside Add_Load, AFTER WinForms'' own PerformAutoScale pass, not inline before ShowDialog' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+
+    # PerformAutoScale runs during CreateControl, itself part of
+    # ShowDialog()'s own handle-creation sequence -- i.e. strictly AFTER
+    # this function body finishes executing and strictly BEFORE Load fires.
+    # $root.GetPreferredSize() already reflects true DPI-scaled AutoSize
+    # control sizes (GetPreferredSize measures actual current font metrics,
+    # which the OS already renders bigger at 150%/200%); assigning that
+    # straight to $form.MinimumSize/$form.Size BEFORE ShowDialog would let
+    # the still-pending PerformAutoScale multiply those already-scaled
+    # numbers a second time (Form.ScaleControl scales MinimumSize/
+    # MaximumSize unconditionally). Add_Load is the standard WinForms
+    # pattern for this precise reason: it fires after auto-scale but before
+    # the form is painted, so there is no visible resize flicker either.
+    Assert-That ($windowBody.Value -match [regex]::Escape('$form.Add_Load({')) 'the MinimumSize/Size measurement should be wrapped in an Add_Load handler'
+
+    $loadHandlerMatch = [regex]::Match($windowBody.Value, '(?s)\$form\.Add_Load\(\{(.*?)\}\)\r?\n')
+    Assert-That $loadHandlerMatch.Success 'sanity: should be able to isolate the Add_Load handler body'
+    $loadHandlerBody = $loadHandlerMatch.Groups[1].Value
+    Assert-That ($loadHandlerBody -match [regex]::Escape('$contentPreferredSize = $root.GetPreferredSize([System.Drawing.Size]::Empty)')) 'GetPreferredSize should be measured INSIDE Add_Load, not before ShowDialog'
+    Assert-That ($loadHandlerBody -match [regex]::Escape('$form.MinimumSize =')) 'MinimumSize should be assigned INSIDE Add_Load'
+    Assert-That ($loadHandlerBody -match [regex]::Escape('$form.Size =')) 'the default startup Size should be assigned INSIDE Add_Load too (same double-scaling risk applies to it)'
+
+    # The Add_Load handler must be the ONLY place these get assigned --
+    # nothing outside it should set $form.MinimumSize/$form.Size using the
+    # panel's PreferredSize before the handle/auto-scale exist.
+    $beforeLoadHandler = $windowBody.Value.Substring(0, $loadHandlerMatch.Index)
+    Assert-That (-not ($beforeLoadHandler -match [regex]::Escape('$contentPreferredSize ='))) 'GetPreferredSize must not be measured anywhere before the Add_Load handler'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: the default startup Size has real headroom above the computed MinimumSize floor, not just Max(640/660, floor)' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+
+    # [Math]::Max(660, floor) alone degenerates to exactly the floor (zero
+    # headroom for the paths ListBox's Percent row) whenever the floor
+    # exceeds 660, which is the normal case at 125%+ DPI -- the height side
+    # must add real headroom on top of that Max, not just take it verbatim.
+    Assert-That ($windowBody.Value -match '\[Math\]::Max\(660,\s*\$form\.MinimumSize\.Height\)\s*\+\s*\d+') 'the default Size''s height should be Max(660, floor) PLUS a real headroom constant, not Max(660, floor) alone'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: wizard steps and the Connect dialog set AutoScroll, as a defensive backstop against an AutoSize label overlapping a fixed-position neighbor' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $functionNames = @('Show-WizardWelcomeStep', 'Show-WizardInstallStep', 'Show-WizardVibepolloStep', 'Show-WizardWatchdogStep', 'Show-WizardDoneStep', 'Show-VibepolloConnectDialog')
+    foreach ($name in $functionNames) {
+        $nextFunctionMatch = [regex]::Match($source, "(?s)function $name \{.*?\r?\n\}\r?\n\r?\nfunction ")
+        Assert-That $nextFunctionMatch.Success "sanity: should be able to locate $name's body"
+        Assert-That ($nextFunctionMatch.Value -match [regex]::Escape('$form.AutoScroll = $true')) "$name should set `$form.AutoScroll = `$true as a defensive backstop -- these forms position controls relative to the PREVIOUS control's own AutoSize Bottom (not a constant Y) specifically to avoid overlap, but AutoScroll is what catches the residual case of the total content still ending up taller than this FixedDialog"
+    }
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: wizard/Connect-dialog labels embedding a real filesystem path are positioned off the PREVIOUS control''s own measured Bottom, not a constant Y' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+
+    $installBody = [regex]::Match($source, '(?s)function Show-WizardInstallStep \{.*?\n\}\r?\n\r?\nfunction Show-WizardVibepolloStep')
+    Assert-That $installBody.Success 'sanity: should be able to locate Show-WizardInstallStep''s body'
+    Assert-That ($installBody.Value -match [regex]::Escape('$lblData = New-GuiLabel -Text (''Data folder: '' + $State.DataDir) -X 15 -Y ($lblProgramBottom + 4)')) 'Show-WizardInstallStep''s $lblData (embeds $State.DataDir, an arbitrary-length path) should be positioned off $lblProgram''s own measured Bottom, not a constant Y that a wrapped $lblProgram could grow into'
+
+    $welcomeBody = [regex]::Match($source, '(?s)function Show-WizardWelcomeStep \{.*?\n\}\r?\n\r?\nfunction Show-WizardInstallStep')
+    Assert-That $welcomeBody.Success 'sanity: should be able to locate Show-WizardWelcomeStep''s body'
+    Assert-That ($welcomeBody.Value -match [regex]::Escape('$lblProgram = New-GuiLabel -Text ''Program folder (fixed):'' -X 15 -Y ($introBottom + 15)')) 'Show-WizardWelcomeStep''s $lblProgram should be positioned off $intro''s own measured Bottom'
+    Assert-That ($welcomeBody.Value -match [regex]::Escape('$lblData = New-GuiLabel -Text ''Data folder (paths.txt, profiles, log -- fixed):'' -X 15 -Y ($txtProgramBottom + 10)')) 'Show-WizardWelcomeStep''s $lblData should be positioned off $txtProgram''s own measured Bottom'
+} | Out-Null
+
+Invoke-Scenario -Name 'Adaptive layout: New-GuiFlowRow supports an opt-in -VerticalCenter switch, used by the Main Window''s mixed-height watchdog controls row' -Body {
+    $source = Read-TextFile $script:ManagerScriptSource
+    $flowRowBody = [regex]::Match($source, '(?s)function New-GuiFlowRow \{.*?\n\}\r?\n\r?\nfunction New-GuiTextBox')
+    Assert-That $flowRowBody.Success 'sanity: should be able to locate New-GuiFlowRow''s body'
+    Assert-That ($flowRowBody.Value -match [regex]::Escape('[switch]$VerticalCenter')) 'New-GuiFlowRow should accept an opt-in -VerticalCenter switch'
+
+    $windowBody = [regex]::Match($source, '(?s)function Show-MainWindow \{.*?\n\}\r?\n\r?\n# -')
+    Assert-That $windowBody.Success 'sanity: should be able to locate Show-MainWindow''s body'
+    Assert-That ($windowBody.Value -match [regex]::Escape('$watchdogControlsRow = New-GuiFlowRow -Controls @($cbLogon2, $cbPoll2, $nudPoll2, $lblMin2, $btnApplyWatchdog, $btnUnregisterWatchdog) -VerticalCenter')) 'the watchdog row (checkboxes/NumericUpDown/label all shorter than the AutoSize buttons) should opt into -VerticalCenter so the mixed-height controls do not all top-flush against the row''s own top edge'
+
+    # Every all-button row (same-height children) is left at the default
+    # (off) -- -VerticalCenter is a no-op there and this documents the
+    # opt-in stays scoped to the one row that actually needs it.
+    $otherRowMatches = @([regex]::Matches($windowBody.Value, 'New-GuiFlowRow\s+-Controls\s+@\([^)]*\)(?!\s*-VerticalCenter)'))
+    Assert-That (@($otherRowMatches).Count -ge 3) "expected the paths/connect/bottom button rows (all same-height buttons) to stay without -VerticalCenter, found $(@($otherRowMatches).Count) such rows"
 } | Out-Null
 
 # ===========================================================================

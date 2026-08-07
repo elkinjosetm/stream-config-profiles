@@ -506,19 +506,24 @@ function Install-App {
         New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
     }
 
-    $enginePayload = Get-EnginePayload -ScriptDir $ScriptDir
-    $engineDest = Join-Path $DataDir 'sync-configs.ps1'
-    [System.IO.File]::WriteAllText($engineDest, $enginePayload, $script:Utf8NoBomEncoding)
-
-    $templatePayload = Get-TemplatePayload -ScriptDir $ScriptDir
-    $templateDest = Join-Path $DataDir 'paths.example.txt'
-    [System.IO.File]::WriteAllText($templateDest, $templatePayload, $script:Utf8NoBomEncoding)
-
-    $pathsTxt = Join-Path $DataDir 'paths.txt'
-    if (-not (Test-Path -LiteralPath $pathsTxt)) {
-        [System.IO.File]::WriteAllText($pathsTxt, $templatePayload, $script:Utf8NoBomEncoding)
-    }
-
+    # PROGRAM (manager.ps1 + launch.vbs) is written BEFORE DATA (engine +
+    # template), not after: this is the identity/version marker a later
+    # Get-ManagerUpgradeDecision run will compare against (via
+    # Test-ManagerUpgradeNeeded's own path/content check), so if a failure
+    # happens partway through this function (a locked file, a disk error),
+    # writing PROGRAM first means either (a) PROGRAM never changed and DATA
+    # never got touched either -- the pre-existing installation is still
+    # fully self-consistent and the exception propagates for the caller to
+    # retry -- or (b) PROGRAM already reflects the new version even though
+    # DATA's refresh below failed, which at least means the NEXT launch is
+    # running the new manager.ps1 rather than being silently and
+    # permanently stuck comparing an old running copy against an old
+    # installed copy (path-equal -> Get-ManagerUpgradeDecision's own
+    # "that IS the installed copy" short-circuit -> never retried). The
+    # old order (DATA, then PROGRAM) had the opposite, worse failure mode:
+    # a manager.ps1 write failure left DATA upgraded but PROGRAM stale,
+    # and the next shortcut launch (from that now again-stale PROGRAM
+    # path) would see Running == Installed and never even attempt a retry.
     $managerContent = Get-Content -LiteralPath $ManagerScriptPath -Raw -Encoding UTF8
     $managerDest = Join-Path $ProgramDir 'manager.ps1'
     [System.IO.File]::WriteAllText($managerDest, $managerContent, $script:Utf8NoBomEncoding)
@@ -535,6 +540,19 @@ function Install-App {
     $launchVbsDest = Get-ManagerLaunchVbsPath -ProgramDir $ProgramDir
     [System.IO.File]::WriteAllText($launchVbsDest, $launchVbsContent, $script:Utf8NoBomEncoding)
 
+    $enginePayload = Get-EnginePayload -ScriptDir $ScriptDir
+    $engineDest = Join-Path $DataDir 'sync-configs.ps1'
+    [System.IO.File]::WriteAllText($engineDest, $enginePayload, $script:Utf8NoBomEncoding)
+
+    $templatePayload = Get-TemplatePayload -ScriptDir $ScriptDir
+    $templateDest = Join-Path $DataDir 'paths.example.txt'
+    [System.IO.File]::WriteAllText($templateDest, $templatePayload, $script:Utf8NoBomEncoding)
+
+    $pathsTxt = Join-Path $DataDir 'paths.txt'
+    if (-not (Test-Path -LiteralPath $pathsTxt)) {
+        [System.IO.File]::WriteAllText($pathsTxt, $templatePayload, $script:Utf8NoBomEncoding)
+    }
+
     return [PSCustomObject]@{
         ProgramDir  = $ProgramDir
         DataDir     = $DataDir
@@ -544,6 +562,97 @@ function Install-App {
         ManagerPath = $managerDest
         LaunchVbsPath = $launchVbsDest
     }
+}
+
+# ---------------------------------------------------------------------------
+# Upgrade detection
+#
+# The field gap this exists to close: running a newer Setup.bat (which
+# extracts to %TEMP% and runs from there -- see dist\StreamConfigProfiles-
+# Setup.bat) or any newer standalone dist\manager.ps1 against an EXISTING
+# installation used to open the Main Window directly, never touching the
+# installed PROGRAM\manager.ps1/DATA\sync-configs.ps1/launch.vbs/shortcuts
+# -- so a shipped fix (e.g. the wscript/launch.vbs indirection itself) never
+# reached an already-installed machine. Show-ManagerGui calls
+# Test-ManagerUpgradeNeeded once, right before opening the Main Window
+# (never before the First-Run Wizard -- there is nothing installed yet to
+# upgrade there), and Invoke-ManagerAutoUpgrade performs the upgrade when
+# it says yes.
+#
+# Get-ManagerUpgradeDecision is pure logic (no filesystem access at all),
+# so a test harness can drive every path/content permutation directly;
+# Test-ManagerUpgradeNeeded is the thin disk-facing wrapper that reads the
+# two files and calls it -- the same split as Get-ManagerShortcutDefinition
+# vs New-ShortcutFile above.
+# ---------------------------------------------------------------------------
+
+function Get-ManagerUpgradeDecision {
+    # Decides whether an automatic upgrade should run, given:
+    #   - the path of the SCRIPT CURRENTLY RUNNING (Show-ManagerGui's own
+    #     already-resolved manager script path -- see its comment on why
+    #     that is the right value to pass, not a path some other step may
+    #     have repointed since),
+    #   - the path PROGRAM\manager.ps1 would be at (whether or not it
+    #     exists), and
+    #   - whether that installed copy exists, plus both files' contents
+    #     (only meaningful when it does).
+    #
+    # No installed copy at all -> nothing to upgrade (never seen in
+    # practice once DATA\sync-configs.ps1 exists, which is what gates the
+    # Main Window branch in Show-ManagerGui to begin with, but a corrupted
+    # or manually-deleted PROGRAM\manager.ps1 must not crash the check).
+    # Running FROM the installed copy (normal shortcut launch, comparing
+    # resolved/normalized paths, case-insensitively -- Windows paths) ->
+    # no upgrade; that IS the installed copy. Identical content -> no-op,
+    # nothing changed. Anything else (different path, different content --
+    # e.g. Setup.bat's %TEMP%-extracted copy against an older installed
+    # copy) -> upgrade.
+    param(
+        [Parameter(Mandatory = $true)][string]$RunningScriptPath,
+        [Parameter(Mandatory = $true)][string]$InstalledManagerPath,
+        [Parameter(Mandatory = $true)][bool]$InstalledManagerExists,
+        [string]$RunningScriptContent,
+        [string]$InstalledManagerContent
+    )
+
+    if (-not $InstalledManagerExists) {
+        return $false
+    }
+
+    $runningResolved = [System.IO.Path]::GetFullPath($RunningScriptPath)
+    $installedResolved = [System.IO.Path]::GetFullPath($InstalledManagerPath)
+    if ([string]::Equals($runningResolved, $installedResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    if ($RunningScriptContent -eq $InstalledManagerContent) {
+        return $false
+    }
+
+    return $true
+}
+
+function Test-ManagerUpgradeNeeded {
+    # Disk-facing wrapper: reads the running script and the installed
+    # PROGRAM\manager.ps1 copy (if any) -- both small local text files, a
+    # cheap read/compare -- and hands them to Get-ManagerUpgradeDecision
+    # above, which is what a test harness actually exercises.
+    param(
+        [Parameter(Mandatory = $true)][string]$RunningScriptPath,
+        [Parameter(Mandatory = $true)][string]$ProgramDir
+    )
+
+    $installedManagerPath = Join-Path $ProgramDir 'manager.ps1'
+    $installedExists = Test-Path -LiteralPath $installedManagerPath
+
+    $runningContent = $null
+    $installedContent = $null
+    if ($installedExists) {
+        $runningContent = Get-Content -LiteralPath $RunningScriptPath -Raw -Encoding UTF8
+        $installedContent = Get-Content -LiteralPath $installedManagerPath -Raw -Encoding UTF8
+    }
+
+    return Get-ManagerUpgradeDecision -RunningScriptPath $RunningScriptPath -InstalledManagerPath $installedManagerPath -InstalledManagerExists $installedExists -RunningScriptContent $runningContent -InstalledManagerContent $installedContent
 }
 
 # ---------------------------------------------------------------------------
@@ -2987,21 +3096,144 @@ function New-GuiForm {
 }
 
 function New-GuiLabel {
+    # AutoSize, always -- a Label's Size used to be a fixed pixel box (this
+    # factory's own -Width/-Height), which is exactly what the field-
+    # reported crop/truncation bug at 150%/200% DPI was: the box's pixel
+    # size never scaled with the font that DOES scale via New-GuiForm's
+    # AutoScaleMode/AutoScaleDimensions, so a wider-than-designed rendered
+    # string got clipped to the box. AutoSize makes the control's own Size
+    # follow its actual (scaled) rendered text instead.
+    #
+    # -Width is kept, but repurposed as a WRAP width (MaximumSize.Width)
+    # rather than a hard box: a multi-line intro paragraph (e.g. the wizard
+    # welcome text) still wraps at roughly the same designed width, but the
+    # Label's Height now grows to fit however many lines that wrapping
+    # actually produces at the current DPI/font scale, instead of a fixed
+    # -Height clipping any wrap that needed one more line than the pixel
+    # box assumed. MaximumSize.Height = 0 means "no height cap" (width-only
+    # constraint) -- the standard WinForms idiom for autosize-with-wrapping.
+    #
+    # -Height is still accepted (every existing call site still passes one)
+    # but is otherwise unused now that AutoSize/MaximumSize own sizing --
+    # kept as a parameter purely so no call site needs editing just to drop
+    # an argument that used to matter and no longer does.
     param([string]$Text, [int]$X, [int]$Y, [int]$Width, [int]$Height = 20)
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $Text
     $lbl.Location = New-Object System.Drawing.Point($X, $Y)
-    $lbl.Size = New-Object System.Drawing.Size($Width, $Height)
+    $lbl.AutoSize = $true
+    if ($Width -gt 0) {
+        $lbl.MaximumSize = New-Object System.Drawing.Size($Width, 0)
+    }
     return $lbl
 }
 
 function New-GuiButton {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 100, [int]$Height = 28)
+    # AutoSize, always -- no fixed pixel -Width/-Height parameter exists on
+    # this factory at all any more (every call site in the file was
+    # audited and updated), because a fixed button box is precisely the
+    # field-reported bug: 'Connect/Reconnect...', 'Register/Update',
+    # 'Add Folder...', etc. rendered as 'Connect/Reconne', 'Register/Upd',
+    # 'Add Folder...' cropped once the DPI-scaled 9pt text (see New-GuiForm)
+    # no longer fit the pixel box the button was designed against at
+    # 100%/96 DPI. AutoSizeMode.GrowAndShrink means the button always sizes
+    # to its own text (plus Padding) at whatever scale is actually in
+    # effect, so it can never crop -- and every button in this app now
+    # lives inside a New-GuiFlowRow (below), which lays sibling buttons out
+    # left-to-right around whatever width each one actually ends up needing,
+    # so a wider button never overlaps its neighbor either.
+    #
+    # -X/-Y are still accepted for the handful of call sites that add a
+    # button directly to a Form rather than into a New-GuiFlowRow (there are
+    # none left as of this writing, but a future one-off button is free to
+    # position itself this way rather than being forced through a flow row
+    # it doesn't need). Omitted entirely -- the common case -- the button is
+    # left at (0, 0) for its container's own layout (a FlowLayoutPanel) to
+    # reposition.
+    param([string]$Text, [int]$X, [int]$Y)
     $btn = New-Object System.Windows.Forms.Button
     $btn.Text = $Text
-    $btn.Location = New-Object System.Drawing.Point($X, $Y)
-    $btn.Size = New-Object System.Drawing.Size($Width, $Height)
+    $btn.AutoSize = $true
+    $btn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    # A little breathing room around the text (Padding, inside the button's
+    # own border) and between adjacent buttons in a flow row (Margin) --
+    # both scale together with everything else since they're plain pixel
+    # values on a control whose Font (inherited from the Form -- see
+    # New-GuiForm) is what AutoScaleMode/AutoScaleDimensions actually scale.
+    $btn.Padding = New-Object System.Windows.Forms.Padding(10, 2, 10, 2)
+    $btn.Margin = New-Object System.Windows.Forms.Padding(4, 4, 4, 4)
+    # A short label ('OK', 'Next >') would otherwise autosize down to a
+    # visually tiny button; this floors the width without capping how much
+    # further GrowAndShrink can grow it for a longer label.
+    $btn.MinimumSize = New-Object System.Drawing.Size(75, 0)
+    if ($PSBoundParameters.ContainsKey('X') -or $PSBoundParameters.ContainsKey('Y')) {
+        $btn.Location = New-Object System.Drawing.Point($X, $Y)
+    }
     return $btn
+}
+
+function New-GuiFlowRow {
+    # Every row of buttons in this GUI (Main Window and every wizard step /
+    # the Connect dialog) is built through this one factory instead of
+    # one-off inline FlowLayoutPanel styling, so the
+    # auto-size/no-wrap/spacing choices below stay identical everywhere and
+    # a future new row can't accidentally forget one of them. Also used for
+    # the Main Window's watchdog-controls row, which mixes checkboxes/a
+    # NumericUpDown/a label alongside two buttons on one line -- FlowLayoutPanel
+    # doesn't care what kind of control it's laying out.
+    #
+    # AutoSize + GrowAndShrink means the row's own Size always matches
+    # exactly what its (also AutoSize) children need at the current DPI/
+    # font scale -- never a fixed pixel box that could clip a child, and
+    # never bigger than needed either (which matters for a row that also
+    # sets Anchor = 'Bottom, Right' on a fixed-size wizard dialog: the row
+    # must shrink back down at 100% DPI, not just grow at 150%/200%).
+    # WrapContents = $false: a row that ran out of horizontal space should
+    # widen (its container's job to have room, or scroll/anchor around it)
+    # rather than silently wrapping button 3 onto an invisible second line.
+    #
+    # -VerticalCenter (opt-in, off by default so every existing all-button
+    # row is unaffected): FlowLayoutPanel top-aligns children of differing
+    # heights, which top-flushes every control to the row's own top edge --
+    # fine for a row of same-height buttons, but the watchdog controls row
+    # mixes an AutoSize CheckBox/Label (~15-17px) with a 23px NumericUpDown
+    # and ~29px AutoSize Buttons, all flush against the row's top with dead
+    # space below the shorter ones instead of a shared visual centerline.
+    # Nudges each shorter child down by half the (tallest child - its own
+    # height) via its own top Margin, computed once here (each child's
+    # PreferredSize is measured directly, independent of any parent/handle,
+    # same as every other pre-ShowDialog GetPreferredSize call in this
+    # file) rather than relying on FlowLayoutPanel's own (top-only)
+    # alignment.
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control[]]$Controls,
+        [switch]$VerticalCenter
+    )
+    $flow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $flow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $flow.WrapContents = $false
+    $flow.AutoSize = $true
+    $flow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $flow.Margin = New-Object System.Windows.Forms.Padding(0)
+    $flow.Padding = New-Object System.Windows.Forms.Padding(0)
+    foreach ($control in $Controls) {
+        $flow.Controls.Add($control)
+    }
+
+    if ($VerticalCenter -and $Controls.Count -gt 0) {
+        $heights = @($Controls | ForEach-Object { $_.Margin.Top + $_.GetPreferredSize([System.Drawing.Size]::Empty).Height + $_.Margin.Bottom })
+        $maxHeight = ($heights | Measure-Object -Maximum).Maximum
+        foreach ($control in $Controls) {
+            $ownHeight = $control.Margin.Top + $control.GetPreferredSize([System.Drawing.Size]::Empty).Height + $control.Margin.Bottom
+            $extraTop = [Math]::Floor(($maxHeight - $ownHeight) / 2)
+            if ($extraTop -gt 0) {
+                $m = $control.Margin
+                $control.Margin = New-Object System.Windows.Forms.Padding($m.Left, ($m.Top + $extraTop), $m.Right, $m.Bottom)
+            }
+        }
+    }
+
+    return $flow
 }
 
 function New-GuiTextBox {
@@ -3014,11 +3246,21 @@ function New-GuiTextBox {
 }
 
 function New-GuiCheckBox {
+    # AutoSize, same reasoning and same field-reported bug as New-GuiLabel/
+    # New-GuiButton above -- 'Logon/Unlock' (a checkbox, not a button)
+    # rendered as 'Logon/Unl' at 150%/200% DPI against this factory's old
+    # fixed -Width box. -Width is kept, repurposed exactly like
+    # New-GuiLabel's: a wrap-width ceiling (MaximumSize.Width) for the
+    # couple of long checkbox labels (e.g. 'Protect at logon / unlock
+    # (recommended)') rather than a hard box that used to just clip.
     param([string]$Text, [int]$X, [int]$Y, [int]$Width, [bool]$Checked = $false)
     $cb = New-Object System.Windows.Forms.CheckBox
     $cb.Text = $Text
     $cb.Location = New-Object System.Drawing.Point($X, $Y)
-    $cb.Size = New-Object System.Drawing.Size($Width, 24)
+    $cb.AutoSize = $true
+    if ($Width -gt 0) {
+        $cb.MaximumSize = New-Object System.Drawing.Size($Width, 0)
+    }
     $cb.Checked = $Checked
     return $cb
 }
@@ -3165,15 +3407,34 @@ function Show-WizardWelcomeStep {
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
+    # Defensive backstop, not the primary fix: every control below is
+    # positioned relative to the PREVIOUS control's own (AutoSize) Bottom
+    # rather than a constant Y, specifically so a wrapped multi-line label
+    # can never grow into its neighbor -- but AutoScroll still catches the
+    # rare case where the sum of everything ends up taller than this fixed-
+    # size dialog anyway (e.g. an extreme DPI scale, or ProgramDir/DataDir
+    # long enough to wrap into more lines than this design ever anticipated).
+    $form.AutoScroll = $true
 
-    $intro = New-GuiLabel -Text 'This wizard installs stream-config-profiles and connects it to Vibepollo/Apollo.' -X 15 -Y 15 -Width 480 -Height 30
+    $intro = New-GuiLabel -Text 'This wizard installs stream-config-profiles and connects it to Vibepollo/Apollo.' -X 15 -Y 15 -Width 480
     $form.Controls.Add($intro)
+    $introBottom = $intro.Location.Y + $intro.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
-    $lblProgram = New-GuiLabel -Text 'Program folder (fixed):' -X 15 -Y 60 -Width 200
+    # $lblProgram/$lblData below embed $State.ProgramDir/$State.DataDir --
+    # real filesystem paths (a user profile can push these well past a
+    # short design-time guess) -- so their own AutoSize height, not a
+    # constant gap, is what the FOLLOWING control's Y is computed from. A
+    # label that wraps to more lines than this form's original fixed-pixel
+    # layout assumed used to grow straight into the control below it
+    # (unbounded AutoSize height against a still-constant neighbor Y) --
+    # this is what actually prevents that, not just a bigger fixed gap.
+    $lblProgram = New-GuiLabel -Text 'Program folder (fixed):' -X 15 -Y ($introBottom + 15) -Width 480
     $form.Controls.Add($lblProgram)
-    $txtProgram = New-GuiTextBox -X 15 -Y 82 -Width 480 -Text $State.ProgramDir
+    $lblProgramBottom = $lblProgram.Location.Y + $lblProgram.GetPreferredSize([System.Drawing.Size]::Empty).Height
+    $txtProgram = New-GuiTextBox -X 15 -Y ($lblProgramBottom + 4) -Width 480 -Text $State.ProgramDir
     $txtProgram.ReadOnly = $true
     $form.Controls.Add($txtProgram)
+    $txtProgramBottom = $txtProgram.Location.Y + $txtProgram.Size.Height
 
     # Fixed, exactly like ProgramDir -- deliberately not user-changeable.
     # PROGRAM is contractually allowed to hold manager.ps1 ONLY, so there
@@ -3185,16 +3446,19 @@ function Show-WizardWelcomeStep {
     # every other DataDir-dependent feature (paths list, sync.log viewer,
     # watchdog, uninstall's engine-identifier match) pointed at the wrong
     # folder.
-    $lblData = New-GuiLabel -Text 'Data folder (paths.txt, profiles, log -- fixed):' -X 15 -Y 115 -Width 420
+    $lblData = New-GuiLabel -Text 'Data folder (paths.txt, profiles, log -- fixed):' -X 15 -Y ($txtProgramBottom + 10) -Width 480
     $form.Controls.Add($lblData)
-    $txtData = New-GuiTextBox -X 15 -Y 137 -Width 480 -Text $State.DataDir
+    $lblDataBottom = $lblData.Location.Y + $lblData.GetPreferredSize([System.Drawing.Size]::Empty).Height
+    $txtData = New-GuiTextBox -X 15 -Y ($lblDataBottom + 4) -Width 480 -Text $State.DataDir
     $txtData.ReadOnly = $true
     $form.Controls.Add($txtData)
 
-    $btnCancel = New-GuiButton -Text 'Cancel' -X 300 -Y 220 -Width 90
-    $btnNext = New-GuiButton -Text 'Next >' -X 400 -Y 220 -Width 90
-    $form.Controls.Add($btnCancel)
-    $form.Controls.Add($btnNext)
+    $btnCancel = New-GuiButton -Text 'Cancel'
+    $btnNext = New-GuiButton -Text 'Next >'
+    $buttonRow = New-GuiFlowRow -Controls @($btnCancel, $btnNext)
+    $buttonRow.Location = New-Object System.Drawing.Point(295, 215)
+    $buttonRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Right'
+    $form.Controls.Add($buttonRow)
     $form.CancelButton = $btnCancel
     $form.AcceptButton = $btnNext
 
@@ -3220,27 +3484,36 @@ function Show-WizardInstallStep {
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
+    $form.AutoScroll = $true
 
-    $lblProgram = New-GuiLabel -Text ('Program folder: ' + $State.ProgramDir) -X 15 -Y 15 -Width 480 -Height 20
+    # Positioned relative to the previous label's own (AutoSize) Bottom, not
+    # a constant Y -- both labels embed real filesystem paths
+    # ($State.ProgramDir/$State.DataDir), which can wrap to more lines than
+    # this form's original fixed-pixel layout assumed; a constant next-Y
+    # would let that extra height grow straight into $txtResult below.
+    $lblProgram = New-GuiLabel -Text ('Program folder: ' + $State.ProgramDir) -X 15 -Y 15 -Width 480
     $form.Controls.Add($lblProgram)
-    $lblData = New-GuiLabel -Text ('Data folder: ' + $State.DataDir) -X 15 -Y 40 -Width 480 -Height 20
+    $lblProgramBottom = $lblProgram.Location.Y + $lblProgram.GetPreferredSize([System.Drawing.Size]::Empty).Height
+    $lblData = New-GuiLabel -Text ('Data folder: ' + $State.DataDir) -X 15 -Y ($lblProgramBottom + 4) -Width 480
     $form.Controls.Add($lblData)
+    $lblDataBottom = $lblData.Location.Y + $lblData.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
     $txtResult = New-Object System.Windows.Forms.TextBox
-    $txtResult.Location = New-Object System.Drawing.Point(15, 75)
+    $txtResult.Location = New-Object System.Drawing.Point(15, ($lblDataBottom + 10))
     $txtResult.Size = New-Object System.Drawing.Size(475, 135)
     $txtResult.Multiline = $true
     $txtResult.ReadOnly = $true
     $txtResult.ScrollBars = 'Vertical'
     $form.Controls.Add($txtResult)
 
-    $btnBack = New-GuiButton -Text '< Back' -X 110 -Y 220 -Width 90
-    $btnCancel = New-GuiButton -Text 'Cancel' -X 300 -Y 220 -Width 90
-    $btnNext = New-GuiButton -Text 'Next >' -X 400 -Y 220 -Width 90
+    $btnBack = New-GuiButton -Text '< Back'
+    $btnCancel = New-GuiButton -Text 'Cancel'
+    $btnNext = New-GuiButton -Text 'Next >'
     $btnNext.Enabled = $false
-    $form.Controls.Add($btnBack)
-    $form.Controls.Add($btnCancel)
-    $form.Controls.Add($btnNext)
+    $buttonRow = New-GuiFlowRow -Controls @($btnBack, $btnCancel, $btnNext)
+    $buttonRow.Location = New-Object System.Drawing.Point(105, 215)
+    $buttonRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Right'
+    $form.Controls.Add($buttonRow)
     $form.CancelButton = $btnCancel
 
     # Runs as soon as this step is built (before ShowDialog), rather than
@@ -3295,9 +3568,15 @@ function Show-WizardVibepolloStep {
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
+    $form.AutoScroll = $true
 
-    $intro = New-GuiLabel -Text 'Point this at your Vibepollo/Apollo/Sunshine .conf file. This adds one global prep command pair and keeps any existing entries from other tools.' -X 15 -Y 15 -Width 510 -Height 45
+    # $intro is the longest fixed message in the whole wizard; positioned
+    # relative to its own (AutoSize) Bottom below, not a constant Y, so a
+    # DPI/font scale that needs one more wrapped line than this form's
+    # original fixed-pixel layout assumed cannot grow it into $lblConf.
+    $intro = New-GuiLabel -Text 'Point this at your Vibepollo/Apollo/Sunshine .conf file. This adds one global prep command pair and keeps any existing entries from other tools.' -X 15 -Y 15 -Width 510
     $form.Controls.Add($intro)
+    $introBottom = $intro.Location.Y + $intro.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
     $detected = $null
     $detectOutcome = Invoke-GuiSafe -Action { Find-HostConf }
@@ -3311,12 +3590,15 @@ function Show-WizardVibepolloStep {
         $State.ConfPath = $detected
     }
 
-    $lblConf = New-GuiLabel -Text 'Conf file path:' -X 15 -Y 70 -Width 150
+    $lblConf = New-GuiLabel -Text 'Conf file path:' -X 15 -Y ($introBottom + 15) -Width 150
     $form.Controls.Add($lblConf)
-    $txtConf = New-GuiTextBox -X 15 -Y 92 -Width 420 -Text $State.ConfPath
+    $lblConfBottom = $lblConf.Location.Y + $lblConf.GetPreferredSize([System.Drawing.Size]::Empty).Height
+    $txtConfY = $lblConfBottom + 6
+    $txtConf = New-GuiTextBox -X 15 -Y $txtConfY -Width 420 -Text $State.ConfPath
     $form.Controls.Add($txtConf)
-    $btnBrowse = New-GuiButton -Text 'Browse...' -X 440 -Y 91 -Width 90
+    $btnBrowse = New-GuiButton -Text 'Browse...' -X 440 -Y ($txtConfY - 1)
     $form.Controls.Add($btnBrowse)
+    $txtConfBottom = $txtConfY + $txtConf.Size.Height
     $btnBrowse.Add_Click({
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
         $ofd.Filter = 'Config files (*.conf)|*.conf|All files (*.*)|*.*'
@@ -3345,13 +3627,18 @@ function Show-WizardVibepolloStep {
 
     $noteText = 'Not auto-detected -- browse to it manually if Vibepollo/Apollo is installed.'
     if (-not [string]::IsNullOrWhiteSpace($detected)) {
+        # $noteText embeds a real detected conf path here -- another
+        # unbounded-length string, same reason as $lblConf/$intro above --
+        # so $txtResult below is positioned off $lblNote's own measured
+        # Bottom, not a constant Y.
         $noteText = "Auto-detected: $detected"
     }
-    $lblNote = New-GuiLabel -Text $noteText -X 15 -Y 122 -Width 510 -Height 20
+    $lblNote = New-GuiLabel -Text $noteText -X 15 -Y ($txtConfBottom + 8) -Width 510
     $form.Controls.Add($lblNote)
+    $lblNoteBottom = $lblNote.Location.Y + $lblNote.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
     $txtResult = New-Object System.Windows.Forms.TextBox
-    $txtResult.Location = New-Object System.Drawing.Point(15, 150)
+    $txtResult.Location = New-Object System.Drawing.Point(15, ($lblNoteBottom + 10))
     $txtResult.Size = New-Object System.Drawing.Size(515, 90)
     $txtResult.Multiline = $true
     $txtResult.ReadOnly = $true
@@ -3359,15 +3646,19 @@ function Show-WizardVibepolloStep {
     $txtResult.Text = "Not connected yet -- click Connect, or Next to skip (you can run this later via manager.ps1 -Action register-vibepollo)."
     $form.Controls.Add($txtResult)
 
-    $btnConnect = New-GuiButton -Text 'Connect' -X 15 -Y 250 -Width 110
-    $form.Controls.Add($btnConnect)
+    $btnConnect = New-GuiButton -Text 'Connect'
+    $connectRow = New-GuiFlowRow -Controls @($btnConnect)
+    $connectRow.Location = New-Object System.Drawing.Point(15, 245)
+    $connectRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Left'
+    $form.Controls.Add($connectRow)
 
-    $btnBack = New-GuiButton -Text '< Back' -X 260 -Y 250 -Width 90
-    $btnCancel = New-GuiButton -Text 'Cancel' -X 355 -Y 250 -Width 90
-    $btnNext = New-GuiButton -Text 'Next >' -X 450 -Y 250 -Width 90
-    $form.Controls.Add($btnBack)
-    $form.Controls.Add($btnCancel)
-    $form.Controls.Add($btnNext)
+    $btnBack = New-GuiButton -Text '< Back'
+    $btnCancel = New-GuiButton -Text 'Cancel'
+    $btnNext = New-GuiButton -Text 'Next >'
+    $navRow = New-GuiFlowRow -Controls @($btnBack, $btnCancel, $btnNext)
+    $navRow.Location = New-Object System.Drawing.Point(255, 245)
+    $navRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Right'
+    $form.Controls.Add($navRow)
     $form.CancelButton = $btnCancel
 
     $btnConnect.Add_Click({
@@ -3451,18 +3742,27 @@ function Show-WizardWatchdogStep {
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
+    $form.AutoScroll = $true
 
-    $intro = New-GuiLabel -Text "The watchdog re-applies your local config if a stream ends without a clean disconnect (crash, force-quit, sleep). Windows may ask for administrator approval to register the logon/unlock protection below -- the watchdog itself always runs as your normal user account, never elevated." -X 15 -Y 15 -Width 480 -Height 65
+    # $intro is the longest fixed message in the wizard after the Vibepollo
+    # step's -- positioned relative to its own (AutoSize) Bottom below, same
+    # reason as every other step: a DPI/font scale needing one more wrapped
+    # line than this form's original fixed-pixel layout assumed must not
+    # grow it into $cbLogon.
+    $intro = New-GuiLabel -Text "The watchdog re-applies your local config if a stream ends without a clean disconnect (crash, force-quit, sleep). Windows may ask for administrator approval to register the logon/unlock protection below -- the watchdog itself always runs as your normal user account, never elevated." -X 15 -Y 15 -Width 480
     $form.Controls.Add($intro)
+    $introBottom = $intro.Location.Y + $intro.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
-    $cbLogon = New-GuiCheckBox -Text 'Protect at logon / unlock (recommended)' -X 20 -Y 90 -Width 400 -Checked $true
+    $cbLogon = New-GuiCheckBox -Text 'Protect at logon / unlock (recommended)' -X 20 -Y ($introBottom + 15) -Width 400 -Checked $true
     $form.Controls.Add($cbLogon)
+    $cbLogonBottom = $cbLogon.Location.Y + $cbLogon.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
-    $cbPoll = New-GuiCheckBox -Text 'Also check periodically, every' -X 20 -Y 120 -Width 210 -Checked ([bool]$State.IncludePoll)
+    $cbPollY = $cbLogonBottom + 6
+    $cbPoll = New-GuiCheckBox -Text 'Also check periodically, every' -X 20 -Y $cbPollY -Width 210 -Checked ([bool]$State.IncludePoll)
     $form.Controls.Add($cbPoll)
 
     $nudPoll = New-Object System.Windows.Forms.NumericUpDown
-    $nudPoll.Location = New-Object System.Drawing.Point(235, 118)
+    $nudPoll.Location = New-Object System.Drawing.Point(235, ($cbPollY - 2))
     $nudPoll.Size = New-Object System.Drawing.Size(60, 23)
     $nudPoll.Minimum = 5
     $nudPoll.Maximum = 1440
@@ -3474,17 +3774,18 @@ function Show-WizardWatchdogStep {
     $nudPoll.Enabled = [bool]$State.IncludePoll
     $form.Controls.Add($nudPoll)
 
-    $lblMinutes = New-GuiLabel -Text 'minutes (min. 5)' -X 300 -Y 120 -Width 150
+    $lblMinutes = New-GuiLabel -Text 'minutes (min. 5)' -X 300 -Y $cbPollY -Width 150
     $form.Controls.Add($lblMinutes)
 
     $cbPoll.Add_CheckedChanged({ $nudPoll.Enabled = $cbPoll.Checked })
 
-    $btnBack = New-GuiButton -Text '< Back' -X 110 -Y 220 -Width 90
-    $btnCancel = New-GuiButton -Text 'Cancel' -X 300 -Y 220 -Width 90
-    $btnNext = New-GuiButton -Text 'Next >' -X 400 -Y 220 -Width 90
-    $form.Controls.Add($btnBack)
-    $form.Controls.Add($btnCancel)
-    $form.Controls.Add($btnNext)
+    $btnBack = New-GuiButton -Text '< Back'
+    $btnCancel = New-GuiButton -Text 'Cancel'
+    $btnNext = New-GuiButton -Text 'Next >'
+    $buttonRow = New-GuiFlowRow -Controls @($btnBack, $btnCancel, $btnNext)
+    $buttonRow.Location = New-Object System.Drawing.Point(105, 215)
+    $buttonRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Right'
+    $form.Controls.Add($buttonRow)
     $form.CancelButton = $btnCancel
 
     $btnBack.Add_Click({ $form.DialogResult = [System.Windows.Forms.DialogResult]::Retry; $form.Close() })
@@ -3563,20 +3864,30 @@ function Show-WizardDoneStep {
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
+    $form.AutoScroll = $true
 
+    # $text embeds $State.DataDir (a real filesystem path) on its own
+    # trailing line -- positioned relative to $lbl's own (AutoSize) Bottom
+    # below, same reason as every other step: an unexpectedly long path or
+    # DPI/font scale needing more wrapped lines than this form's original
+    # fixed-pixel layout assumed must not grow $lbl into the checkboxes.
     $text = "Setup is complete.`r`n`r`nWhat's next:`r`n -  Add or remove game config paths from the main window (Add File / Add Folder).`r`n -  Watchdog and connection status are shown on the main window; you can re-run either step from there.`r`n -  See README.md for the paths.txt format and troubleshooting tips.`r`n`r`nData folder: $($State.DataDir)"
-    $lbl = New-GuiLabel -Text $text -X 15 -Y 15 -Width 480 -Height 180
+    $lbl = New-GuiLabel -Text $text -X 15 -Y 15 -Width 480
     $form.Controls.Add($lbl)
+    $lblBottom = $lbl.Location.Y + $lbl.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
-    $cbStartMenuShortcut = New-GuiCheckBox -Text 'Add to Start Menu' -X 20 -Y 200 -Width 250 -Checked $true
+    $cbStartMenuShortcut = New-GuiCheckBox -Text 'Add to Start Menu' -X 20 -Y ($lblBottom + 15) -Width 250 -Checked $true
     $form.Controls.Add($cbStartMenuShortcut)
-    $cbDesktopShortcut = New-GuiCheckBox -Text 'Create Desktop shortcut' -X 20 -Y 228 -Width 250 -Checked $false
+    $cbStartMenuBottom = $cbStartMenuShortcut.Location.Y + $cbStartMenuShortcut.GetPreferredSize([System.Drawing.Size]::Empty).Height
+    $cbDesktopShortcut = New-GuiCheckBox -Text 'Create Desktop shortcut' -X 20 -Y ($cbStartMenuBottom + 6) -Width 250 -Checked $false
     $form.Controls.Add($cbDesktopShortcut)
 
-    $btnBack = New-GuiButton -Text '< Back' -X 300 -Y 275 -Width 90
-    $btnFinish = New-GuiButton -Text 'Finish' -X 400 -Y 275 -Width 90
-    $form.Controls.Add($btnBack)
-    $form.Controls.Add($btnFinish)
+    $btnBack = New-GuiButton -Text '< Back'
+    $btnFinish = New-GuiButton -Text 'Finish'
+    $buttonRow = New-GuiFlowRow -Controls @($btnBack, $btnFinish)
+    $buttonRow.Location = New-Object System.Drawing.Point(295, 270)
+    $buttonRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Right'
+    $form.Controls.Add($buttonRow)
     $form.AcceptButton = $btnFinish
 
     $btnBack.Add_Click({ $form.DialogResult = [System.Windows.Forms.DialogResult]::Retry; $form.Close() })
@@ -3695,6 +4006,7 @@ function Show-VibepolloConnectDialog {
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
+    $form.AutoScroll = $true
 
     $detected = $null
     $detectOutcome = Invoke-GuiSafe -Action { Find-HostConf }
@@ -3707,9 +4019,11 @@ function Show-VibepolloConnectDialog {
 
     $lblConf = New-GuiLabel -Text 'Conf file path:' -X 15 -Y 15 -Width 150
     $form.Controls.Add($lblConf)
-    $txtConf = New-GuiTextBox -X 15 -Y 37 -Width 420 -Text $detected
+    $lblConfBottom = $lblConf.Location.Y + $lblConf.GetPreferredSize([System.Drawing.Size]::Empty).Height
+    $txtConfY = $lblConfBottom + 6
+    $txtConf = New-GuiTextBox -X 15 -Y $txtConfY -Width 420 -Text $detected
     $form.Controls.Add($txtConf)
-    $btnBrowse = New-GuiButton -Text 'Browse...' -X 440 -Y 36 -Width 90
+    $btnBrowse = New-GuiButton -Text 'Browse...' -X 440 -Y ($txtConfY - 1)
     $form.Controls.Add($btnBrowse)
     $btnBrowse.Add_Click({
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
@@ -3721,16 +4035,22 @@ function Show-VibepolloConnectDialog {
             $txtConf.Text = $ofd.FileName
         }
     })
+    $txtConfBottom = $txtConfY + $txtConf.Size.Height
 
+    # $noteText embeds a real detected conf path here -- an unbounded-length
+    # string -- so $txtResult below is positioned off $lblNote's own
+    # measured Bottom, not a constant Y (same reason as the wizard's own
+    # Vibepollo step).
     $noteText = 'Not auto-detected -- browse to it manually if Vibepollo/Apollo is installed.'
     if (-not [string]::IsNullOrWhiteSpace($detected)) {
         $noteText = "Auto-detected: $detected"
     }
-    $lblNote = New-GuiLabel -Text $noteText -X 15 -Y 67 -Width 510 -Height 20
+    $lblNote = New-GuiLabel -Text $noteText -X 15 -Y ($txtConfBottom + 8) -Width 510
     $form.Controls.Add($lblNote)
+    $lblNoteBottom = $lblNote.Location.Y + $lblNote.GetPreferredSize([System.Drawing.Size]::Empty).Height
 
     $txtResult = New-Object System.Windows.Forms.TextBox
-    $txtResult.Location = New-Object System.Drawing.Point(15, 95)
+    $txtResult.Location = New-Object System.Drawing.Point(15, ($lblNoteBottom + 10))
     $txtResult.Size = New-Object System.Drawing.Size(515, 100)
     $txtResult.Multiline = $true
     $txtResult.ReadOnly = $true
@@ -3750,8 +4070,11 @@ function Show-VibepolloConnectDialog {
     # cannot see a portable/custom-path install reached only via Browse.
     $outcomeState = [PSCustomObject]@{ Connected = $false; ConfPath = $null }
 
-    $btnConnect = New-GuiButton -Text 'Connect' -X 15 -Y 205 -Width 110
-    $form.Controls.Add($btnConnect)
+    $btnConnect = New-GuiButton -Text 'Connect'
+    $connectRow = New-GuiFlowRow -Controls @($btnConnect)
+    $connectRow.Location = New-Object System.Drawing.Point(15, 200)
+    $connectRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Left'
+    $form.Controls.Add($connectRow)
     $btnConnect.Add_Click({
         $confPath = $txtConf.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($confPath) -or -not (Test-Path -LiteralPath $confPath)) {
@@ -3776,8 +4099,11 @@ function Show-VibepolloConnectDialog {
         }
     })
 
-    $btnClose = New-GuiButton -Text 'Close' -X 450 -Y 205 -Width 90
-    $form.Controls.Add($btnClose)
+    $btnClose = New-GuiButton -Text 'Close'
+    $closeRow = New-GuiFlowRow -Controls @($btnClose)
+    $closeRow.Location = New-Object System.Drawing.Point(455, 200)
+    $closeRow.Anchor = [System.Windows.Forms.AnchorStyles]'Bottom, Right'
+    $form.Controls.Add($closeRow)
     $form.CancelButton = $btnClose
     $btnClose.Add_Click({ $form.DialogResult = [System.Windows.Forms.DialogResult]::OK; $form.Close() })
 
@@ -3830,16 +4156,59 @@ function Show-MainWindow {
     $form.Text = 'stream-config-profiles'
     $form.Size = New-Object System.Drawing.Size(640, 660)
     $form.StartPosition = 'CenterScreen'
-    $form.MinimumSize = New-Object System.Drawing.Size(560, 580)
 
-    $lblPaths = New-GuiLabel -Text 'Configured game config paths:' -X 15 -Y 15 -Width 300
-    $form.Controls.Add($lblPaths)
+    # Root layout: one column, one AutoSize row per section below, except
+    # the paths ListBox's row (Percent 100) -- the field-reported bug was
+    # that resizing/maximizing only ever stretched the ListBox sideways
+    # while every other control sat frozen top-left with the extra space
+    # going nowhere. A TableLayoutPanel docked to fill the whole client
+    # area, with every row's height driven by its own content (AutoSize)
+    # except one row that explicitly claims 100% of whatever space is left
+    # over, is what makes that one row (and only that one) actually grow on
+    # BOTH axes on resize/maximize, and makes every other row reflow
+    # instead of clipping when its own content's DPI-scaled size changes.
+    $root = New-Object System.Windows.Forms.TableLayoutPanel
+    $root.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.ColumnCount = 1
+    $root.RowCount = 10
+    $root.Padding = New-Object System.Windows.Forms.Padding(15, 15, 15, 15)
+    $root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+
+    # Row indices named once, used at every $root.Controls.Add(control, 0,
+    # rowIndex) call site below instead of a bare magic number -- row 1
+    # (the paths ListBox) is the only Percent row; every other row is
+    # AutoSize.
+    $rowPathsLabel = 0
+    $rowPathsList = 1
+    $rowPathsButtons = 2
+    $rowConnLabel = 3
+    $rowConnStatus = 4
+    $rowConnButton = 5
+    $rowWatchdogLabel = 6
+    $rowWatchdogStatus = 7
+    $rowWatchdogControls = 8
+    $rowBottomButtons = 9
+    for ($rowIndex = 0; $rowIndex -lt $root.RowCount; $rowIndex++) {
+        if ($rowIndex -eq $rowPathsList) {
+            $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+        }
+        else {
+            $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
+        }
+    }
+    $form.Controls.Add($root)
+
+    $lblPaths = New-GuiLabel -Text 'Configured game config paths:'
+    $root.Controls.Add($lblPaths, 0, $rowPathsLabel)
 
     $lstPaths = New-Object System.Windows.Forms.ListBox
-    $lstPaths.Location = New-Object System.Drawing.Point(15, 40)
-    $lstPaths.Size = New-Object System.Drawing.Size(590, 180)
-    $lstPaths.Anchor = 'Top,Left,Right'
-    $form.Controls.Add($lstPaths)
+    $lstPaths.Dock = [System.Windows.Forms.DockStyle]::Fill
+    # A floor, not a fixed size -- the Percent 100 row above lets this grow
+    # past it (both wider AND taller) on resize/maximize, but the window's
+    # own MinimumSize (computed at the bottom of this function, from the
+    # WHOLE layout's PreferredSize) can never squeeze it below this.
+    $lstPaths.MinimumSize = New-Object System.Drawing.Size(0, 140)
+    $root.Controls.Add($lstPaths, 0, $rowPathsList)
 
     function Sync-PathsList {
         $lstPaths.Items.Clear()
@@ -3852,12 +4221,11 @@ function Show-MainWindow {
     }
     Sync-PathsList
 
-    $btnAddFile = New-GuiButton -Text 'Add File...' -X 15 -Y 230 -Width 110
-    $btnAddFolder = New-GuiButton -Text 'Add Folder...' -X 135 -Y 230 -Width 120
-    $btnRemove = New-GuiButton -Text 'Remove Selected' -X 265 -Y 230 -Width 140
-    $form.Controls.Add($btnAddFile)
-    $form.Controls.Add($btnAddFolder)
-    $form.Controls.Add($btnRemove)
+    $btnAddFile = New-GuiButton -Text 'Add File...'
+    $btnAddFolder = New-GuiButton -Text 'Add Folder...'
+    $btnRemove = New-GuiButton -Text 'Remove Selected'
+    $pathsButtonsRow = New-GuiFlowRow -Controls @($btnAddFile, $btnAddFolder, $btnRemove)
+    $root.Controls.Add($pathsButtonsRow, 0, $rowPathsButtons)
 
     $btnAddFile.Add_Click({
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
@@ -3891,15 +4259,21 @@ function Show-MainWindow {
         }
     })
 
-    $lblVibepollo = New-GuiLabel -Text 'Vibepollo/Apollo connection status:' -X 15 -Y 265 -Width 300
-    $form.Controls.Add($lblVibepollo)
+    $lblVibepollo = New-GuiLabel -Text 'Vibepollo/Apollo connection status:'
+    $root.Controls.Add($lblVibepollo, 0, $rowConnLabel)
 
     $txtVibepolloStatus = New-Object System.Windows.Forms.TextBox
-    $txtVibepolloStatus.Location = New-Object System.Drawing.Point(15, 288)
-    $txtVibepolloStatus.Size = New-Object System.Drawing.Size(590, 40)
     $txtVibepolloStatus.Multiline = $true
     $txtVibepolloStatus.ReadOnly = $true
-    $form.Controls.Add($txtVibepolloStatus)
+    # Size here is only a preferred-HEIGHT hint for this AutoSize row -- a
+    # Multiline TextBox's GetPreferredSize (unlike an AutoSize Label's)
+    # just returns its current Size rather than computing one from its
+    # text/font, so the row would otherwise collapse to near-zero. Dock =
+    # Fill then stretches the box across the row's full (already decided)
+    # width, matching every other status panel's full-width anchoring.
+    $txtVibepolloStatus.Size = New-Object System.Drawing.Size(1, 40)
+    $txtVibepolloStatus.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Controls.Add($txtVibepolloStatus, 0, $rowConnStatus)
 
     function Sync-VibepolloStatus {
         # Re-detects the conf path every time this window opens (or the
@@ -3938,8 +4312,9 @@ function Show-MainWindow {
     }
     Sync-VibepolloStatus
 
-    $btnConnectVibepollo = New-GuiButton -Text 'Connect/Reconnect...' -X 15 -Y 330 -Width 160
-    $form.Controls.Add($btnConnectVibepollo)
+    $btnConnectVibepollo = New-GuiButton -Text 'Connect/Reconnect...'
+    $connectButtonRow = New-GuiFlowRow -Controls @($btnConnectVibepollo)
+    $root.Controls.Add($connectButtonRow, 0, $rowConnButton)
     $btnConnectVibepollo.Add_Click({
         $dialogResult = Show-VibepolloConnectDialog -ManagerScriptPath $ManagerScriptPath -DataDir $DataDir
         if ($null -ne $dialogResult -and $dialogResult.Connected -and -not [string]::IsNullOrWhiteSpace([string]$dialogResult.ConfPath)) {
@@ -3948,15 +4323,18 @@ function Show-MainWindow {
         Sync-VibepolloStatus
     })
 
-    $lblWatchdog = New-GuiLabel -Text 'Watchdog protection status:' -X 15 -Y 375 -Width 300
-    $form.Controls.Add($lblWatchdog)
+    $lblWatchdog = New-GuiLabel -Text 'Watchdog protection status:'
+    $root.Controls.Add($lblWatchdog, 0, $rowWatchdogLabel)
 
     $txtWatchdogStatus = New-Object System.Windows.Forms.TextBox
-    $txtWatchdogStatus.Location = New-Object System.Drawing.Point(15, 398)
-    $txtWatchdogStatus.Size = New-Object System.Drawing.Size(590, 55)
     $txtWatchdogStatus.Multiline = $true
     $txtWatchdogStatus.ReadOnly = $true
-    $form.Controls.Add($txtWatchdogStatus)
+    # See txtVibepolloStatus's own comment above -- same Size-as-preferred-
+    # height-hint-then-Dock-Fill trick, taller (55) to match this box's
+    # original design (it can show one more status line).
+    $txtWatchdogStatus.Size = New-Object System.Drawing.Size(1, 55)
+    $txtWatchdogStatus.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Controls.Add($txtWatchdogStatus, 0, $rowWatchdogStatus)
 
     function Sync-WatchdogStatus {
         $outcome = Invoke-GuiSafe -Action { Get-WatchdogTaskExistence }
@@ -3990,29 +4368,29 @@ function Show-MainWindow {
         $initialStatus = $initialStatusOutcome.Value
     }
 
-    $cbLogon2 = New-GuiCheckBox -Text 'Logon/Unlock' -X 15 -Y 462 -Width 130 -Checked ([bool]$initialStatus['StreamConfigProfiles-Settle-Logon'])
-    $cbPoll2 = New-GuiCheckBox -Text 'Poll every' -X 150 -Y 462 -Width 90 -Checked ([bool]$initialStatus['StreamConfigProfiles-Settle-Poll'])
-    $form.Controls.Add($cbLogon2)
-    $form.Controls.Add($cbPoll2)
+    $cbLogon2 = New-GuiCheckBox -Text 'Logon/Unlock' -Checked ([bool]$initialStatus['StreamConfigProfiles-Settle-Logon'])
+    $cbPoll2 = New-GuiCheckBox -Text 'Poll every' -Checked ([bool]$initialStatus['StreamConfigProfiles-Settle-Poll'])
 
     $nudPoll2 = New-Object System.Windows.Forms.NumericUpDown
-    $nudPoll2.Location = New-Object System.Drawing.Point(245, 460)
+    # NumericUpDown keeps a fixed, reasonable width -- unlike a Label/
+    # Button/CheckBox, its "text" is always a short number, never anything
+    # that could grow enough at 150%/200% DPI to actually crop within this
+    # box (the box itself still scales with everything else via
+    # AutoScaleMode/AutoScaleDimensions on the Form -- see New-GuiForm).
     $nudPoll2.Size = New-Object System.Drawing.Size(55, 23)
     $nudPoll2.Minimum = 5
     $nudPoll2.Maximum = 1440
     $nudPoll2.Value = 15
     $nudPoll2.Enabled = $cbPoll2.Checked
-    $form.Controls.Add($nudPoll2)
     $cbPoll2.Add_CheckedChanged({ $nudPoll2.Enabled = $cbPoll2.Checked })
 
-    $lblMin2 = New-GuiLabel -Text 'min' -X 305 -Y 462 -Width 40
-    $form.Controls.Add($lblMin2)
+    $lblMin2 = New-GuiLabel -Text 'min'
 
-    $btnApplyWatchdog = New-GuiButton -Text 'Register/Update' -X 425 -Y 458 -Width 130
-    $form.Controls.Add($btnApplyWatchdog)
+    $btnApplyWatchdog = New-GuiButton -Text 'Register/Update'
+    $btnUnregisterWatchdog = New-GuiButton -Text 'Unregister All'
 
-    $btnUnregisterWatchdog = New-GuiButton -Text 'Unregister All' -X 15 -Y 492 -Width 120
-    $form.Controls.Add($btnUnregisterWatchdog)
+    $watchdogControlsRow = New-GuiFlowRow -Controls @($cbLogon2, $cbPoll2, $nudPoll2, $lblMin2, $btnApplyWatchdog, $btnUnregisterWatchdog) -VerticalCenter
+    $root.Controls.Add($watchdogControlsRow, 0, $rowWatchdogControls)
 
     $btnApplyWatchdog.Add_Click({
         $includePoll = $cbPoll2.Checked
@@ -4066,10 +4444,11 @@ function Show-MainWindow {
         Sync-WatchdogStatus
     })
 
-    $btnOpenData = New-GuiButton -Text 'Open data folder' -X 15 -Y 530 -Width 150
-    $btnViewLog = New-GuiButton -Text 'View sync.log' -X 175 -Y 530 -Width 130
-    $form.Controls.Add($btnOpenData)
-    $form.Controls.Add($btnViewLog)
+    $btnOpenData = New-GuiButton -Text 'Open data folder'
+    $btnViewLog = New-GuiButton -Text 'View sync.log'
+    $btnDisconnect = New-GuiButton -Text 'Disconnect all / Uninstall...'
+    $bottomButtonsRow = New-GuiFlowRow -Controls @($btnOpenData, $btnViewLog, $btnDisconnect)
+    $root.Controls.Add($bottomButtonsRow, 0, $rowBottomButtons)
 
     $btnOpenData.Add_Click({
         # -ArgumentList is a single already-quoted string, not a raw path:
@@ -4090,8 +4469,63 @@ function Show-MainWindow {
         } | Out-Null
     })
 
-    $btnDisconnect = New-GuiButton -Text 'Disconnect all / Uninstall...' -X 320 -Y 530 -Width 285
-    $form.Controls.Add($btnDisconnect)
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $form.MaximizeBox = $true
+    $form.MinimizeBox = $true
+
+    # MinimumSize/Size from the layout's own PreferredSize -- but computed
+    # inside Add_Load, NOT here (right after building $root), and that
+    # timing is load-bearing, not cosmetic. New-GuiForm sets AutoScaleMode =
+    # Font with a 96-DPI (7,15) design basis; WinForms performs its one
+    # PerformAutoScale pass -- which multiplies every explicitly-assigned
+    # Size/MinimumSize/MaximumSize by (CurrentAutoScaleDimensions / (7,15))
+    # -- during CreateControl, itself part of ShowDialog()'s own handle-
+    # creation sequence, i.e. AFTER this function returns control to
+    # ShowDialog() but BEFORE Load fires. $root.GetPreferredSize() ALREADY
+    # reflects the true DPI-scaled pixel size for every AutoSize
+    # Label/Button/CheckBox in the tree (GetPreferredSize measures text via
+    # the actual current font metrics, which the OS already renders bigger
+    # at 150%/200% -- that's independent of and prior to WinForms' own
+    # AutoScaleFactor multiplication). Calling it here, before ShowDialog,
+    # and assigning its result straight to $form.MinimumSize/$form.Size
+    # would let the still-pending PerformAutoScale pass multiply those
+    # already-scaled numbers a SECOND time -- Form.ScaleControl scales
+    # MinimumSize/MaximumSize unconditionally, with no way to know part of
+    # what it's holding was already DPI-correct. Deferring the measurement
+    # to Add_Load sidesteps this entirely: Load fires once PerformAutoScale
+    # has already run (and before the form is painted, so there is no
+    # visible resize flicker), so $root.GetPreferredSize() here reflects
+    # the layout's FINAL, singly-scaled sizes, and the two assignments below
+    # are the only scaling pass they will ever go through.
+    $form.Add_Load({
+        $contentPreferredSize = $root.GetPreferredSize([System.Drawing.Size]::Empty)
+        $chromeWidth = $form.Size.Width - $form.ClientSize.Width
+        $chromeHeight = $form.Size.Height - $form.ClientSize.Height
+        $form.MinimumSize = New-Object System.Drawing.Size(($contentPreferredSize.Width + $chromeWidth), ($contentPreferredSize.Height + $chromeHeight))
+
+        # Never let the computed floor exceed the actual screen's working
+        # area -- an extreme DPI/content combination should still leave the
+        # window movable and closable rather than spawning larger than (or
+        # partly off) the desktop.
+        $workingArea = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
+        if ($form.MinimumSize.Width -gt $workingArea.Width -or $form.MinimumSize.Height -gt $workingArea.Height) {
+            $form.MinimumSize = New-Object System.Drawing.Size(([Math]::Min($form.MinimumSize.Width, $workingArea.Width)), ([Math]::Min($form.MinimumSize.Height, $workingArea.Height)))
+        }
+
+        # A sane default startup size: real headroom ABOVE the computed
+        # floor (not just [Math]::Max(640, floor)) so the paths ListBox (the
+        # one Percent row) always has room to actually show as growable
+        # before the user resizes/maximizes -- Max alone degenerates to
+        # exactly the floor (zero headroom) whenever the floor exceeds
+        # 640x660, which is the normal case at 125%+ DPI. Never smaller than
+        # the floor itself, since WinForms never lets a Form's Size go below
+        # its MinimumSize once both are set; clamped to the working area for
+        # the same reason as MinimumSize above.
+        $form.Size = New-Object System.Drawing.Size(([Math]::Max(640, $form.MinimumSize.Width)), ([Math]::Max(660, $form.MinimumSize.Height) + 160))
+        if ($form.Size.Width -gt $workingArea.Width -or $form.Size.Height -gt $workingArea.Height) {
+            $form.Size = New-Object System.Drawing.Size(([Math]::Min($form.Size.Width, $workingArea.Width)), ([Math]::Min($form.Size.Height, $workingArea.Height)))
+        }
+    })
 
     $btnDisconnect.Add_Click({
         $confirm1 = Show-GuiConfirm -Text 'This removes the Vibepollo/Apollo connection, the watchdog tasks, and the program files. Continue?' -Title 'Disconnect stream-config-profiles'
@@ -4196,6 +4630,125 @@ function Show-MainWindow {
 # GUI entry point
 # ---------------------------------------------------------------------------
 
+function Update-ManagerInstallationInPlace {
+    # The actual upgrade side effects, entirely GUI-free (no
+    # System.Windows.Forms reference anywhere in this function) so a test
+    # harness can call it directly without an Add-Type -AssemblyName
+    # System.Windows.Forms even being possible (this file's own WinForms
+    # calls are Windows-only). Re-runs Install-App -- idempotent: refreshes
+    # DATA\sync-configs.ps1, DATA\paths.example.txt, PROGRAM\manager.ps1,
+    # PROGRAM\launch.vbs; paths.txt/state.json/sync.log/profiles\ are
+    # untouched by design (see Install-App's own comment) -- then rewrites,
+    # never creates, whichever of the two known shortcut locations (see
+    # Get-ManagerShortcutPaths) already exists, so an old shortcut still
+    # pointing at powershell.exe directly (a pre-launch.vbs install) gets
+    # the current wscript/launch.vbs definition without ever creating a
+    # shortcut the user never asked for.
+    param(
+        [Parameter(Mandatory = $true)][string]$RunningManagerScriptPath,
+        [Parameter(Mandatory = $true)][string]$ProgramDir,
+        [Parameter(Mandatory = $true)][string]$DataDir,
+        [string]$ScriptDir,
+
+        # Same override-else-real-folder shape as New-ManagerShortcut's own
+        # -DesktopDir/-ProgramsDir params, for the same reason: a test
+        # harness needs to point this at sandbox directories, since
+        # [Environment]::GetFolderPath('Desktop'/'Programs') returns an
+        # empty string on this Linux test host (see Get-ManagerShortcutPaths'
+        # own degrade-to-$null handling for that case).
+        [string]$DesktopDir = [Environment]::GetFolderPath('Desktop'),
+        [string]$ProgramsDir = [Environment]::GetFolderPath('Programs')
+    )
+
+    $installResult = Install-App -ProgramDir $ProgramDir -DataDir $DataDir -ManagerScriptPath $RunningManagerScriptPath -ScriptDir $ScriptDir
+
+    $shortcutPaths = Get-ManagerShortcutPaths -DesktopDir $DesktopDir -ProgramsDir $ProgramsDir
+    $definition = Get-ManagerShortcutDefinition -ProgramDir $ProgramDir
+    foreach ($shortcutPath in @($shortcutPaths.Desktop, $shortcutPaths.StartMenu)) {
+        if (-not [string]::IsNullOrWhiteSpace($shortcutPath) -and (Test-Path -LiteralPath $shortcutPath)) {
+            # Best-effort per location, exactly like New-ManagerShortcut's own
+            # per-location try/catch above -- Install-App's own
+            # engine/manager/launch.vbs refresh (the part of the upgrade that
+            # actually matters) already succeeded by the time we get here, so
+            # a failure refreshing one shortcut (a locked/read-only folder)
+            # must never be thrown -- that would abort the OTHER location's
+            # refresh too and make Invoke-GuiSafe report the whole upgrade as
+            # failed even though it substantively succeeded.
+            try {
+                New-ShortcutFile -ShortcutPath $shortcutPath -Definition $definition
+            }
+            catch {
+                # Swallowed by design -- best-effort, see comment above.
+            }
+        }
+    }
+
+    return $installResult
+}
+
+function Invoke-ManagerAutoUpgrade {
+    # Called by Show-ManagerGui exactly once, right before opening the Main
+    # Window -- never before the First-Run Wizard (nothing installed yet
+    # to upgrade there) and never headlessly (the bottom CLI dispatch only
+    # ever calls Show-ManagerGui when -Action was omitted entirely, so a
+    # -Action install/etc. run can never reach this function at all).
+    #
+    # Test-ManagerUpgradeNeeded decides; when it says yes, Update-
+    # ManagerInstallationInPlace above performs the actual upgrade. Every
+    # disk-touching step runs inside Invoke-GuiSafe -- the same standard
+    # GUI error path every other Core-function call site in this file
+    # already uses -- so a failure mid-upgrade (e.g. a locked
+    # PROGRAM\manager.ps1) pops the usual error MessageBox but returns
+    # normally rather than throwing: the caller (Show-ManagerGui) relies on
+    # that to still proceed to Show-MainWindow afterward.
+    #
+    # Returns the ManagerScriptPath the caller should use from here on --
+    # $RunningManagerScriptPath unchanged when no upgrade ran (or it
+    # failed), or the freshly-written PROGRAM\manager.ps1 path when it
+    # succeeded. This matters exactly like Show-WizardInstallStep's own
+    # $State.ManagerScriptPath = $r.ManagerPath (see that function's
+    # comment): every elevation the Main Window can perform afterward
+    # (btnApplyWatchdog/btnUnregisterWatchdog's Invoke-GuiElevatable calls,
+    # the Disconnect/Uninstall handler, Show-VibepolloConnectDialog's
+    # Invoke-VibepolloConnectAction) re-launches elevated against WHATEVER
+    # path Show-ManagerGui hands to Show-MainWindow -- if that were left as
+    # the pre-upgrade $RunningManagerScriptPath, a Setup.bat run would keep
+    # re-elevating against the throwaway %TEMP%\scp_<guid>\manager.ps1
+    # extraction for the rest of this GUI session (it stays on disk and
+    # writable until the extractor's temp dir cleanup after the GUI exits),
+    # a weaker target than PROGRAM since every other process on the box can
+    # write into %TEMP%.
+    param(
+        [Parameter(Mandatory = $true)][string]$RunningManagerScriptPath,
+        [Parameter(Mandatory = $true)][string]$ProgramDir,
+        [Parameter(Mandatory = $true)][string]$DataDir,
+        [string]$ScriptDir
+    )
+
+    $needsUpgradeOutcome = Invoke-GuiSafe -Action { Test-ManagerUpgradeNeeded -RunningScriptPath $RunningManagerScriptPath -ProgramDir $ProgramDir }
+    if (-not $needsUpgradeOutcome.Success -or -not $needsUpgradeOutcome.Value) {
+        # Either the check itself failed (already reported by Invoke-GuiSafe's
+        # own MessageBox) or no upgrade is needed -- either way, the path
+        # we were given is already the right one to keep using.
+        return $RunningManagerScriptPath
+    }
+
+    $upgradeOutcome = Invoke-GuiSafe -Action {
+        Update-ManagerInstallationInPlace -RunningManagerScriptPath $RunningManagerScriptPath -ProgramDir $ProgramDir -DataDir $DataDir -ScriptDir $ScriptDir
+    }
+
+    if ($upgradeOutcome.Success) {
+        [System.Windows.Forms.MessageBox]::Show('Installation updated to this version.', 'stream-config-profiles', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        if ($null -ne $upgradeOutcome.Value -and -not [string]::IsNullOrWhiteSpace([string]$upgradeOutcome.Value.ManagerPath)) {
+            return [string]$upgradeOutcome.Value.ManagerPath
+        }
+    }
+    # else: Invoke-GuiSafe already surfaced the failure via its own
+    # MessageBox -- Show-ManagerGui still proceeds to open the Main Window,
+    # against the path we were given (the upgrade never took effect).
+    return $RunningManagerScriptPath
+}
+
 function Show-ManagerGui {
     # Dispatched when manager.ps1 runs with no -Action. Resolves the same
     # ProgramDir/DataDir/ManagerScriptPath defaults the headless CLI uses,
@@ -4234,7 +4787,21 @@ function Show-ManagerGui {
             Show-FirstRunWizard -ScriptDir $resolvedScriptDir -ProgramDir $resolvedProgramDir -DataDir $resolvedDataDir -ManagerScriptPath $resolvedManagerScriptPath
         }
         else {
-            Show-MainWindow -ScriptDir $resolvedScriptDir -ProgramDir $resolvedProgramDir -DataDir $resolvedDataDir -ManagerScriptPath $resolvedManagerScriptPath
+            # $resolvedManagerScriptPath here is the RUNNING script's own
+            # path (an explicit -ManagerScriptPath override, else
+            # $PSCommandPath -- see Get-ResolvedManagerScriptPath), computed
+            # once above and never repointed since -- exactly what
+            # Invoke-ManagerAutoUpgrade needs to detect a Setup.bat run from
+            # %TEMP% (or any other newer copy) against an existing
+            # installation. Its RETURN VALUE, not $resolvedManagerScriptPath
+            # itself, is what gets handed to Show-MainWindow below -- a
+            # successful upgrade repoints it at PROGRAM\manager.ps1 (see
+            # Invoke-ManagerAutoUpgrade's own comment for why: every
+            # elevation the Main Window can perform re-launches THIS path,
+            # and re-elevating against a %TEMP% script is a weaker target
+            # than PROGRAM).
+            $postUpgradeManagerScriptPath = Invoke-ManagerAutoUpgrade -RunningManagerScriptPath $resolvedManagerScriptPath -ProgramDir $resolvedProgramDir -DataDir $resolvedDataDir -ScriptDir $resolvedScriptDir
+            Show-MainWindow -ScriptDir $resolvedScriptDir -ProgramDir $resolvedProgramDir -DataDir $resolvedDataDir -ManagerScriptPath $postUpgradeManagerScriptPath
         }
     }
     catch {
