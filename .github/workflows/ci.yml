@@ -1,10 +1,24 @@
 name: CI
 
+# Docs-only changes can't affect any test/lint/build job below, so skip
+# scheduling this workflow for them entirely -- the Windows matrix legs
+# bill 2x minutes, and paths.example.txt is deliberately not in this list
+# since it's embedded into the build payload and is code-relevant.
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
 
 # Successive pushes to the same PR/branch cancel the previous in-flight run --
 # the Windows legs bill 2x, so stale runs left running to completion are the
