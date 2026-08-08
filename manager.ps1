@@ -6,8 +6,8 @@
     watchdog scheduled tasks, and uninstalls everything.
 
 .DESCRIPTION
-    See SPEC.md and the v2 install-layout contract for the full design.
-    Summary of the on-disk layout this file manages:
+    See CONTEXT.md and docs/adr/ for the full design and the v2 install-layout
+    contract. Summary of the on-disk layout this file manages:
 
       PROGRAM dir (%LOCALAPPDATA%\Programs\stream-config-profiles)
         manager.ps1            -- this file, copied here by Install-App

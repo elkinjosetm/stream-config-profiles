@@ -3,7 +3,7 @@
     Per-client game config profile sync for Vibepollo/Apollo streaming sessions.
 
 .DESCRIPTION
-    See SPEC.md for the full design. Summary:
+    Design summary:
       - Reads a flat list of file/folder paths from paths.txt (relative to this
         script's own folder).
       - On "do" (session start): saves any pending previous session's disk
@@ -200,7 +200,7 @@ function Get-Hash8 {
 
 function Get-ProfileEntryName {
     # Profile entry name for a configured path: <hash8>_<leaf>.
-    # Per SPEC.md, <hash8> is computed over the lowercased path with
+    # <hash8> is computed over the lowercased path with
     # trailing separators removed. Callers already pass paths normalized by
     # Get-NormalizedConfigPath, so the TrimEnd below is a harmless no-op in
     # practice; it is kept so this function is correct standalone too.
@@ -749,7 +749,7 @@ function Test-PathUnderRoot {
 }
 
 function Invoke-Do {
-    # SPEC.md "do (session start, incoming client = B)":
+    # Do (session start, incoming client = B):
     #   1. Read state.json.
     #   2. Pending session (client A): save disk -> profiles\A; do not touch
     #      _local.
@@ -838,7 +838,7 @@ function Invoke-Do {
 }
 
 function Invoke-Undo {
-    # SPEC.md "undo (session end, active client = B)":
+    # Undo (session end, active client = B):
     #   1. Save disk -> profiles\B.
     #   2. Restore profiles\_local -> disk.
     #   3. Delete/clear state.json.
@@ -883,7 +883,7 @@ function Invoke-Undo {
 
 function Invoke-Settle {
     # Watchdog pass (logon/unlock/poll -- there is deliberately no boot-time
-    # trigger, see CONTRACT B / SPEC.md), run with no client identified
+    # trigger, see CONTRACT B), run with no client identified
     # via env vars -- settle acts purely on whatever state.json records, not
     # on APOLLO_CLIENT_NAME/SUNSHINE_CLIENT_NAME.
     #
@@ -1058,7 +1058,7 @@ function Main {
     $rawClient = Get-ClientNameRaw
     if ([string]::IsNullOrWhiteSpace($rawClient)) {
         # Neither APOLLO_CLIENT_NAME nor SUNSHINE_CLIENT_NAME set -- not a
-        # streaming session. Exit doing nothing, per SPEC.md.
+        # streaming session. Exit doing nothing.
         return
     }
 
@@ -1078,7 +1078,7 @@ function Main {
 
     if (-not (Test-Path -LiteralPath $pathsFile)) {
         # paths.txt is gitignored and created by the user from
-        # paths.example.txt during install (see SPEC.md). Its absence is not
+        # paths.example.txt during install. Its absence is not
         # fatal -- Get-ConfigPaths already tolerates a missing file and
         # returns zero paths -- but it's worth a log line so a user who
         # forgot the copy step can tell why nothing is being synced.
