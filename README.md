@@ -131,6 +131,10 @@ Some games have special behavior worth knowing:
 - **Steam Cloud**: Steam may auto-sync your game's cloud saves, which can interfere with testing. If config changes seem to "reset" unexpectedly, disable Steam Cloud for that game in your Steam client.
 - **Dynamic Optimization**: Some games have dynamic-optimization settings that can override manually chosen values. If restored settings don't seem to stick, check your game's configuration for such options.
 
+## Architecture & Design Decisions
+
+This project's significant design choices are documented in [Architecture Decision Records (ADRs)](docs/adr/README.md) — short records of decisions that were hard to reverse, surprising without context, and the result of a real trade-off. Domain terms (profile, `_local`, settle, elevation boundary, etc.) are defined in [CONTEXT.md](CONTEXT.md).
+
 ## Troubleshooting
 
 Check **sync.log** for details. Each log line shows the timestamp, mode (do/undo), client name, action (save/restore), and the path involved. If a config isn't being applied as expected:
