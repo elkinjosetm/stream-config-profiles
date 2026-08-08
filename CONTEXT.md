@@ -1,6 +1,6 @@
 # Domain Language
 
-Ubiquitous-language glossary for stream-config-profiles. Decisions and their whys live in [docs/adr/](docs/adr/README.md); this file gives names to the seams those decisions cut along.
+Ubiquitous-language glossary for stream-config-profiles. Decisions and their whys live in [docs/adr/](docs/adr/); this file gives names to the seams those decisions cut along.
 
 **profile** — A saved copy of every configured path's config, kept under `profiles\<name>\`. One profile per streaming client, plus the implicit `_local` profile. A profile is "seeded" the first time a client streams (copied from whatever is on disk) and "restored" (copied onto disk) every session after.
 

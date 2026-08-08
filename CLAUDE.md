@@ -1,4 +1,4 @@
-Domain vocabulary lives in [CONTEXT.md](CONTEXT.md); decisions and their whys live in [docs/adr/](docs/adr/README.md) — read the ADRs touching your area first and do not re-litigate them.
+Domain vocabulary lives in [CONTEXT.md](CONTEXT.md); decisions and their whys live in [docs/adr/](docs/adr/) — read the ADRs touching your area first and do not re-litigate them.
 
 ## The two executables
 
