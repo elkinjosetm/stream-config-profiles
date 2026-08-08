@@ -276,7 +276,7 @@ function Get-FolderFileMap {
     return $map
 }
 
-# Independent re-implementation of SPEC.md's profile-entry naming rule
+# Independent re-implementation of the engine's profile-entry naming rule
 # ("<hash8> = first 8 hex chars of MD5 of the lowercased full path"), kept
 # deliberately separate from sync-configs.ps1's own Get-Hash8 /
 # Get-ProfileEntryName so a bug in the script's hashing can't hide behind
@@ -353,7 +353,7 @@ function Invoke-Sync {
 
     $global:LASTEXITCODE = $null
     # -ExecutionPolicy Bypass matches the documented Vibepollo invocation
-    # (SPEC.md / install.md: `powershell.exe -ExecutionPolicy Bypass -File
+    # (install.md: `powershell.exe -ExecutionPolicy Bypass -File
     # ...`) exactly, so the harness exercises the real shipped command line
     # rather than one that happens to work only because CI's default policy
     # is permissive. pwsh accepts (and ignores) the switch on every platform.
@@ -500,7 +500,7 @@ function Add-SkippedScenario {
 }
 
 # ===========================================================================
-# T1..T6 — the main narrative (mirrors SPEC.md's own manual test plan),
+# T1..T6 — the main narrative (mirrors the original manual test plan),
 # run sequentially against one shared sandbox since each step depends on
 # the disk/profile state the previous step left behind.
 # ===========================================================================
@@ -708,7 +708,7 @@ Invoke-Scenario -Name 'T8: folder restore preserves extra files (no /MIR)' -Body
     $sb = New-Sandbox -Label 'T8'
     # Space in the path deliberately: exercises real robocopy.exe on Windows
     # through PowerShell's native-argv quoting for a folder path containing
-    # a space, one of the two hazards SPEC.md's trailing-separator
+    # a space, one of the two hazards the engine's trailing-separator
     # normalization exists for (see also T17).
     $folderDir = Join-Path $sb.Root 'game configs/cfg folder'
     Write-TextFile -Path (Join-Path $folderDir 'file1.txt') -Content 'F1:ORIGINAL'
@@ -992,7 +992,7 @@ else {
 Invoke-Scenario -Name 'T17: trailing separator on a folder path normalizes to a single profile entry' -Body {
     $sb = New-Sandbox -Label 'T17'
     # Space in the path AND a trailing separator: the exact combined hazard
-    # SPEC.md's trailing-separator normalization exists for -- a folder path
+    # the engine's trailing-separator normalization exists for -- a folder path
     # with a space, before normalization ending in a trailing backslash,
     # passed through PowerShell 5.1 native-argv quoting to robocopy.exe.
     $folderDir = Join-Path $sb.Root 'game configs/trailing sep folder'

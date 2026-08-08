@@ -128,9 +128,9 @@ jobs:
       # dist/manager.ps1 that silently falls back to dev mode and throws
       # "embedded payload is empty" on the end user's machine. Running
       # make-dist.ps1 here, per-PR, plus the assertion below, is what
-      # SPEC.md's "verify both payload modes (dev + release)" actually
-      # requires -- release.yml alone only re-discovers a broken build
-      # script after a version tag has already been pushed.
+      # verifying both payload modes (dev + release) actually requires --
+      # release.yml alone only re-discovers a broken build script after a
+      # version tag has already been pushed.
       - name: Run build/make-dist.ps1
         shell: pwsh
         run: ./build/make-dist.ps1

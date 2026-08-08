@@ -77,10 +77,10 @@ jobs:
   # A parse-check alone passes just as happily on a dist file whose payload
   # slots were never actually replaced (still bare markers, falling back
   # to dev mode) or landed in the wrong slot -- see the byte-identical
-  # payload assertion below, which is what SPEC.md's "verify both payload
-  # modes (dev + release)" actually requires. ci.yml's build-dist job runs
-  # the identical assertion per-PR, so a broken build script is caught
-  # long before a tag is ever pushed.
+  # payload assertion below, which is what verifying both payload modes
+  # (dev + release) actually requires. ci.yml's build-dist job runs the
+  # identical assertion per-PR, so a broken build script is caught long
+  # before a tag is ever pushed.
   # ---------------------------------------------------------------------
   build:
     name: Build dist
